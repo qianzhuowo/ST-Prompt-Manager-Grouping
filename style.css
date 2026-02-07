@@ -5,12 +5,14 @@
 #completion_prompt_manager_list .pmg-group-header {
   list-style: none;
   margin: 6px 0;
-  padding: 0;
-  display: block;
-  width: 100%;
-  box-sizing: border-box;
-  flex: 0 0 100%;
-  max-width: 100%;
+  padding: 0 !important;
+  display: block !important;
+  box-sizing: border-box !important;
+  flex: 0 0 100% !important;
+  align-self: stretch !important;
+  grid-column: 1 / -1 !important;
+  min-width: 0 !important;
+  max-width: none !important;
 }
 
 #completion_prompt_manager_list .pmg-group-header-row {
@@ -21,8 +23,8 @@
   border-radius: 10px;
   cursor: pointer;
   user-select: none;
-  width: 100%;
   box-sizing: border-box;
+  /* 不设 width，让它作为 block 子元素自动撑满父 li */
   transition: background-color 0.2s ease, border-color 0.2s ease;
 }
 
@@ -53,8 +55,7 @@
 #completion_prompt_manager_list .pmg-group-header.pmg-level2 {
   position: relative;
   margin-top: 2px;
-  padding-left: 20px;
-  border-left: none;
+  padding-left: 20px !important;
 }
 
 #completion_prompt_manager_list .pmg-group-title {

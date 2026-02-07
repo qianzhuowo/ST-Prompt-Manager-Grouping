@@ -637,6 +637,7 @@
       delete li.dataset.pmgGroup1;
       delete li.dataset.pmgGroup2;
       delete li.dataset.pmgHasPrefix;
+      delete li.dataset.pmgGroupId;
     });
   }
 
@@ -736,12 +737,13 @@
   // Group headers
   // ---------------------------------------------------------------------------
 
-  function createGroupHeaderLi({ level, group1, group2 }) {
+  function createGroupHeaderLi({ level, group1, group2, groupId }) {
     const li = document.createElement('li');
     li.className = `pmg-group-header pmg-level${level}`;
     li.dataset.pmgLevel = String(level);
     li.dataset.pmgGroup1 = String(group1);
     if (group2) li.dataset.pmgGroup2 = String(group2);
+    if (groupId) li.dataset.pmgGroupId = String(groupId);
 
     const row = document.createElement('div');
     row.className = 'pmg-group-header-row';
@@ -772,7 +774,8 @@
 
     const refreshVisual = () => {
       if (level === 1) {
-        const collapsed = isGroup1Collapsed(String(group1));
+        const collapseKey = groupId || String(group1);
+        const collapsed = isGroup1Collapsed(collapseKey);
         arrow.classList.toggle('fa-chevron-right', collapsed);
         arrow.classList.toggle('fa-chevron-down', !collapsed);
         if (fav) {
@@ -799,7 +802,7 @@
       e.preventDefault();
       e.stopPropagation();
       if (level === 1) {
-        const g1 = String(group1);
+        const g1 = groupId || String(group1);
         setCollapsedGroup1(g1, !isGroup1Collapsed(g1));
       } else {
         const key = group2Key(String(group1), String(group2));
@@ -896,6 +899,9 @@
     let currentGroup1 = null;
     let currentGroup2 = null;
 
+    const group1OccCount = {};
+    let currentGroupId = null;
+
     for (const li of items) {
       const a = getPromptNameAnchor(li);
       if (!a) continue;
@@ -907,6 +913,7 @@
       if (!parsed.hasPrefix) {
         currentGroup1 = null;
         currentGroup2 = null;
+        currentGroupId = null;
         li.dataset.pmgHasPrefix = '0';
         li.classList.add('pmg-item-standalone');
         restorePromptDisplayName(li);
@@ -922,17 +929,22 @@
       const g2 = parsed.group2;
 
       if (g1 && g1 !== currentGroup1) {
-        const header1 = createGroupHeaderLi({ level: 1, group1: g1 });
+        const occ = group1OccCount[g1] || 0;
+        group1OccCount[g1] = occ + 1;
+        currentGroupId = `${g1}#${occ}`;
+        const header1 = createGroupHeaderLi({ level: 1, group1: g1, groupId: currentGroupId });
         listEl.insertBefore(header1, li);
         currentGroup1 = g1;
         currentGroup2 = null;
       }
 
+      li.dataset.pmgGroupId = currentGroupId;
+
       if (config.secondLevelEnabled && g1 && g2) {
         li.dataset.pmgGroup2 = g2;
         li.classList.add('pmg-in-group2');
         if (g2 !== currentGroup2) {
-          const header2 = createGroupHeaderLi({ level: 2, group1: g1, group2: g2 });
+          const header2 = createGroupHeaderLi({ level: 2, group1: g1, group2: g2, groupId: currentGroupId });
           listEl.insertBefore(header2, li);
           currentGroup2 = g2;
         }
@@ -963,11 +975,12 @@
         const level = Number(child.dataset.pmgLevel || '0');
         const g1 = child.dataset.pmgGroup1;
         const g2 = child.dataset.pmgGroup2;
+        const gId = child.dataset.pmgGroupId || g1;
 
         if (level === 1) {
           child.style.display = '';
         } else if (level === 2) {
-          child.style.display = g1 && isGroup1Collapsed(g1) ? 'none' : '';
+          child.style.display = gId && isGroup1Collapsed(gId) ? 'none' : '';
           const arrow = child.querySelector('.pmg-collapse-icon');
           if (arrow) {
             const key = group2Key(g1, g2);
@@ -990,10 +1003,10 @@
           }
         }
 
-        if (level === 1 && g1) {
+        if (level === 1 && gId) {
           const arrow = child.querySelector('.pmg-collapse-icon');
           if (arrow) {
-            const collapsed = isGroup1Collapsed(g1);
+            const collapsed = isGroup1Collapsed(gId);
             arrow.classList.toggle('fa-chevron-right', collapsed);
             arrow.classList.toggle('fa-chevron-down', !collapsed);
           }
@@ -1004,14 +1017,15 @@
       if (isPromptItemLi(child)) {
         const g1 = child.dataset.pmgGroup1;
         const g2 = child.dataset.pmgGroup2;
+        const gId = child.dataset.pmgGroupId || g1;
         const hasPrefix = child.dataset.pmgHasPrefix === '1';
 
-        if (!config.groupingEnabled || !hasPrefix || !g1) {
+        if (!config.groupingEnabled || !hasPrefix || !gId) {
           child.style.display = '';
           continue;
         }
 
-        if (isGroup1Collapsed(g1)) {
+        if (isGroup1Collapsed(gId)) {
           child.style.display = 'none';
           continue;
         }
