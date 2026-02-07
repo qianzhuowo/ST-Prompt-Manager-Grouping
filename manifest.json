@@ -1,0 +1,10 @@
+{
+  "name": "Prompt Manager Grouping",
+  "display_name": "预设分组收藏(Prompt Manager Grouping)",
+  "loading_order": 20,
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Qianzhuo",
+  "version": "1.0.0",
+  "description": "对 SillyTavern 的预设列表提供分组/收藏快捷栏（依赖 ST API Wrapper 提供的 window.ST_API）。"
+}

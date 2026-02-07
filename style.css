@@ -1,0 +1,526 @@
+/* Prompt Manager Grouping (PMG) styles */
+
+/* ========== 分组标题 ========== */
+
+#completion_prompt_manager_list .pmg-group-header {
+  list-style: none;
+  margin: 6px 0;
+  padding: 0;
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  flex: 0 0 100%;
+  max-width: 100%;
+}
+
+#completion_prompt_manager_list .pmg-group-header-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+  user-select: none;
+  width: 100%;
+  box-sizing: border-box;
+  transition: background-color 0.2s ease, border-color 0.2s ease;
+}
+
+#completion_prompt_manager_list .pmg-level1 .pmg-group-header-row {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-left: 4px solid #f1c40f;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+}
+
+#completion_prompt_manager_list .pmg-level1 .pmg-group-header-row:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+#completion_prompt_manager_list .pmg-level2 .pmg-group-header-row {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
+#completion_prompt_manager_list .pmg-level2 .pmg-group-header-row:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* 二级组标题：去掉竖线，增加缩进和区分色 */
+#completion_prompt_manager_list .pmg-group-header.pmg-level2 {
+  position: relative;
+  margin-top: 2px;
+  padding-left: 20px;
+  border-left: none;
+}
+
+#completion_prompt_manager_list .pmg-group-title {
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  color: #fff;
+}
+
+#completion_prompt_manager_list .pmg-level1 .pmg-group-title {
+  font-size: 0.92em;
+  text-transform: uppercase;
+  opacity: 0.8;
+}
+
+#completion_prompt_manager_list .pmg-level2 .pmg-group-title {
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 0.88em;
+}
+
+#completion_prompt_manager_list .pmg-collapse-icon {
+  width: 18px;
+  text-align: center;
+  opacity: 0.5;
+  font-size: 0.75em;
+  transition: transform 0.2s ease;
+}
+
+#completion_prompt_manager_list .pmg-flex-spacer {
+  flex: 1;
+}
+
+#completion_prompt_manager_list .pmg-group-fav {
+  opacity: 0.3;
+  transition: opacity 0.2s, color 0.2s;
+}
+
+#completion_prompt_manager_list .pmg-group-header-row:hover .pmg-group-fav {
+  opacity: 1;
+}
+
+/* ========== 扁平化缩进风格（无线条） ========== */
+
+/* 一级子项：侧边槽指示条 */
+#completion_prompt_manager_list li.completion_prompt_manager_prompt.pmg-in-group1 {
+  margin-left: 0;
+  padding-left: 38px !important;
+  border-left: none;
+  border-bottom: none;
+  position: relative;
+}
+
+#completion_prompt_manager_list li.completion_prompt_manager_prompt.pmg-in-group1::before {
+  content: "";
+  position: absolute;
+  left: 14px;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+  background: #f1c40f;
+  opacity: 0.2;
+  border-radius: 4px;
+  transition: opacity 0.2s;
+}
+
+#completion_prompt_manager_list li.completion_prompt_manager_prompt.pmg-in-group1:hover::before {
+  opacity: 0.5;
+}
+
+/* 二级子项：多重侧边槽（体现嵌套） */
+#completion_prompt_manager_list li.completion_prompt_manager_prompt.pmg-in-group2 {
+  padding-left: 58px !important;
+}
+
+/* 二级子项的一级轨道副本 */
+#completion_prompt_manager_list li.completion_prompt_manager_prompt.pmg-in-group2::after {
+  content: "";
+  position: relative;
+  content: "";
+  position: absolute;
+  left: 14px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: #f1c40f;
+  opacity: 0.08;
+  border-radius: 4px;
+}
+
+/* 二级子项的二级轨道 */
+#completion_prompt_manager_list li.completion_prompt_manager_prompt.pmg-in-group2::before {
+  left: 34px;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  background: rgba(255, 255, 255, 0.4);
+  opacity: 0.25;
+}
+
+/* ========== 单独项风格 ========== */
+
+#completion_prompt_manager_list li.completion_prompt_manager_prompt.pmg-item-standalone {
+  margin-top: 4px;
+  border-left: 2px solid transparent;
+  transition: all 0.2s ease;
+}
+
+#completion_prompt_manager_list li.completion_prompt_manager_prompt.pmg-item-standalone:hover {
+  border-left-color: rgba(255, 255, 255, 0.2);
+  padding-left: 12px !important;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* 条目悬停效果 */
+#completion_prompt_manager_list li.completion_prompt_manager_prompt:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* ========== 收藏按钮（条目右侧） ========== */
+
+#completion_prompt_manager_list .prompt_manager_prompt_controls .pmg-fav-action {
+  margin-left: 6px;
+  opacity: 0.85;
+}
+
+#completion_prompt_manager_list .pmg-fav-on {
+  color: #ffcc4d;
+  opacity: 1;
+}
+
+#completion_prompt_manager_list .pmg-fav-off {
+  color: rgba(255, 255, 255, 0.55);
+}
+
+/* ========== 禁用原生拖拽（fallback） ========== */
+
+#completion_prompt_manager_list.pmg-no-native-drag .drag-handle {
+  pointer-events: none;
+  opacity: 0.25;
+}
+
+/* ========== 内联收藏面板（预设面板内） ========== */
+
+#completion_prompt_manager #pmg-favorites-holder {
+  margin: 6px 0 10px 0;
+  width: 100%;
+  display: block;
+  box-sizing: border-box;
+  flex: 0 0 100%;
+  max-width: 100%;
+}
+
+#completion_prompt_manager .pmg-fav-drawer {
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.12);
+  width: 100%;
+  display: block;
+  box-sizing: border-box;
+  max-width: 100%;
+}
+
+/* ========== 收藏栏共用样式 ========== */
+
+.pmg-fav-group {
+  display: block;
+  width: 100%;
+}
+
+.pmg-fav-group-row {
+  cursor: pointer;
+  font-weight: 600;
+  border-left: 3px solid rgba(255, 204, 77, 0.5);
+}
+
+.pmg-fav-expand {
+  width: 16px;
+  text-align: center;
+  opacity: 0.85;
+}
+
+.pmg-fav-children {
+  margin-left: 18px;
+  border-left: 2px solid rgba(255, 255, 255, 0.08);
+  padding-left: 10px;
+  margin-top: 4px;
+  margin-bottom: 6px;
+}
+
+.pmg-fav-child-row {
+  padding: 4px 0;
+}
+
+/* 收藏栏内的二级子分组行 */
+.pmg-fav-sub-group-row {
+  cursor: pointer;
+  font-weight: 500;
+  border-left: 2px solid rgba(255, 255, 255, 0.18);
+  padding-left: 4px;
+  opacity: 0.88;
+  font-size: 0.93em;
+}
+
+/* 子分组内嵌套的 children */
+.pmg-fav-children .pmg-fav-children {
+  margin-left: 12px;
+  border-left-color: rgba(255, 255, 255, 0.06);
+}
+
+#completion_prompt_manager .pmg-fav-header {
+  cursor: pointer;
+}
+
+#completion_prompt_manager .pmg-fav-content {
+  padding: 8px 10px;
+}
+
+.pmg-fav-empty {
+  opacity: 0.7;
+  font-size: 0.9em;
+  line-height: 1.4;
+}
+
+.pmg-fav-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.pmg-fav-row:last-child {
+  border-bottom: none;
+}
+
+.pmg-fav-title {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pmg-fav-toggle,
+.pmg-fav-unfav {
+  opacity: 0.9;
+}
+
+.pmg-fav-toggle {
+  font-size: 1.05em;
+}
+
+/* 收藏栏内的⭐颜色 */
+
+.pmg-fav-on {
+  color: #ffcc4d;
+  opacity: 1;
+}
+
+.pmg-fav-off {
+  color: rgba(255, 255, 255, 0.55);
+}
+
+/* ========== 浮动收藏快捷栏 ========== */
+
+/* 浮动触发按钮（星星） */
+#pmg-floating-toggle {
+  position: fixed;
+  bottom: 80px;
+  right: 20px;
+  z-index: 9998;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  cursor: pointer;
+  background: var(--SmartThemeBlurTintColor, rgba(30, 30, 40, 0.85));
+  color: rgba(255, 255, 255, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  transition: transform 0.2s, box-shadow 0.2s, color 0.2s;
+  user-select: none;
+  touch-action: none;
+}
+
+#pmg-floating-toggle:hover {
+  transform: scale(1.1);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+}
+
+/* 拖拽中：禁用 hover 动画和过渡 */
+#pmg-floating-toggle.pmg-floating-dragging {
+  transition: none;
+  transform: scale(1.05);
+  opacity: 0.85;
+  cursor: grabbing;
+}
+
+#pmg-floating-toggle.pmg-floating-dragging:hover {
+  transform: scale(1.05);
+}
+
+#pmg-floating-toggle.pmg-floating-toggle-active {
+  color: #ffcc4d;
+  border-color: rgba(255, 204, 77, 0.3);
+}
+
+/* 浮动面板 */
+#pmg-floating-panel {
+  position: fixed;
+  bottom: 134px;
+  right: 20px;
+  z-index: 9999;
+  width: 360px;
+  max-width: calc(100vw - 40px);
+  max-height: 60vh;
+  border-radius: 14px;
+  background: var(--SmartThemeBlurTintColor, rgba(30, 30, 40, 0.92));
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: opacity 0.25s ease, visibility 0.25s;
+  opacity: 1;
+  transform: translateY(0);
+  visibility: visible;
+}
+
+#pmg-floating-panel.pmg-floating-collapsed {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* 拖拽中 */
+#pmg-floating-panel.pmg-floating-dragging {
+  transition: none;
+  opacity: 0.88;
+}
+
+#pmg-floating-panel.pmg-floating-dragging .pmg-floating-header {
+  cursor: grabbing;
+}
+
+/* 浮动面板 - 头部 */
+.pmg-floating-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  user-select: none;
+  flex-shrink: 0;
+  cursor: grab;
+  touch-action: none;
+}
+
+.pmg-floating-title {
+  flex: 1;
+  font-weight: 600;
+  font-size: 0.95em;
+  opacity: 0.92;
+}
+
+.pmg-floating-close {
+  cursor: pointer;
+  opacity: 0.7;
+  font-size: 14px;
+  padding: 4px;
+  border-radius: 4px;
+  transition: opacity 0.15s;
+}
+
+.pmg-floating-close:hover {
+  opacity: 1;
+}
+
+/* 浮动面板 - 内容 */
+.pmg-floating-content {
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 8px 14px;
+  flex: 1;
+  min-height: 0;
+}
+
+/* 浮动面板内的收藏内容继承共用样式 */
+.pmg-floating-body .pmg-fav-row {
+  padding: 5px 0;
+}
+
+.pmg-floating-body .pmg-fav-children {
+  margin-left: 14px;
+  padding-left: 8px;
+}
+
+.pmg-floating-body .pmg-fav-child-row {
+  padding: 3px 0;
+}
+
+.pmg-floating-body .pmg-fav-empty {
+  padding: 12px 0;
+  text-align: center;
+}
+
+/* 浮动面板滚动条 */
+.pmg-floating-content::-webkit-scrollbar {
+  width: 5px;
+}
+
+.pmg-floating-content::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.pmg-floating-content::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+}
+
+.pmg-floating-content::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+/* ========== 移动端适配 ========== */
+
+@media (max-width: 768px) {
+  #pmg-floating-panel {
+    width: calc(100vw - 24px);
+    right: 12px;
+    bottom: 124px;
+    max-height: 55vh;
+  }
+
+  #pmg-floating-toggle {
+    right: 12px;
+    bottom: 72px;
+    width: 40px;
+    height: 40px;
+    font-size: 16px;
+  }
+}
+
+/* ========== 设置面板 ========== */
+
+.pmg-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pmg-settings-row {
+  display: block;
+}
+
+.pmg-settings-hint {
+  opacity: 0.85;
+  line-height: 1.5;
+}
