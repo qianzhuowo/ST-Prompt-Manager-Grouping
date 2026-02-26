@@ -3558,7 +3558,7 @@
 <div class="pmg-settings">
   <div class="pmg-settings-intro">
     <small>
-      如有建议或者bug, 欢迎反馈! 反馈帖子链接→ <a href="https://www.example.com" target="_blank" rel="noopener noreferrer">预设折叠插件</a>
+      如有建议或者bug, 欢迎反馈! 反馈discord帖子链接→ <a href="https://discord.com/channels/1134557553011998840/1476440866091438091" target="_blank" rel="noopener noreferrer">预设折叠插件</a>
       <br>在GitHub提issue也行！链接→ <a href="https://github.com/qianzhuowo/ST-Prompt-Manager-Grouping" target="_blank" rel="noopener noreferrer">GitHub插件链接</a>
     </small>
   </div>
