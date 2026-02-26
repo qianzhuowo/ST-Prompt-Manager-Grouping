@@ -2,11 +2,16 @@
 
 /* ========== 分组标题 ========== */
 
-#completion_prompt_manager_list .pmg-group-header {
+#completion_prompt_manager_list>.pmg-group-header {
   list-style: none;
   margin: 6px 0;
   padding: 0 !important;
+  /*
+   * 让分组标题占据整行。
+   * 注意：二级组在“一级组收起”时会由 JS 通过 inline style(display:none !important) 隐藏。
+   */
   display: block !important;
+  width: 100% !important;
   box-sizing: border-box !important;
   flex: 0 0 100% !important;
   align-self: stretch !important;
@@ -15,7 +20,7 @@
   max-width: none !important;
 }
 
-#completion_prompt_manager_list .pmg-group-header-row {
+#completion_prompt_manager_list>.pmg-group-header .pmg-group-header-row {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -24,7 +29,9 @@
   cursor: pointer;
   user-select: none;
   box-sizing: border-box;
-  /* 不设 width，让它作为 block 子元素自动撑满父 li */
+  width: 100%;
+  /* 如果上游把 li 设为了 grid，确保 row 跨满所有列 */
+  grid-column: 1 / -1;
   transition: background-color 0.2s ease, border-color 0.2s ease;
 }
 
@@ -302,6 +309,11 @@
   text-overflow: ellipsis;
 }
 
+/* 浮动“快捷收藏栏”：保持单行省略（不换行），更多显示依赖 title 占满可用宽度 */
+#pmg-floating-panel .pmg-floating-body .pmg-fav-title {
+  white-space: nowrap;
+}
+
 .pmg-fav-toggle,
 .pmg-fav-unfav {
   opacity: 0.9;
@@ -371,6 +383,34 @@
   border-color: rgba(255, 204, 77, 0.3);
 }
 
+/* 嵌入模式：按钮放到 QR 栏 / 发送按钮旁 */
+#pmg-floating-toggle.pmg-toggle-embedded {
+  position: static !important;
+  left: auto !important;
+  top: auto !important;
+  right: auto !important;
+  bottom: auto !important;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  font-size: 16px;
+  margin: 0 4px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  touch-action: auto;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+#pmg-floating-toggle.pmg-toggle-embedded:hover {
+  transform: none;
+  box-shadow: none;
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
 /* 浮动面板 */
 #pmg-floating-panel {
   position: fixed;
@@ -422,6 +462,8 @@
   flex-shrink: 0;
   cursor: grab;
   touch-action: none;
+  /* 防止标题过长把按钮挤出可点击区域 */
+  overflow: hidden;
 }
 
 .pmg-floating-title {
@@ -429,6 +471,26 @@
   font-weight: 600;
   font-size: 0.95em;
   opacity: 0.92;
+  /* 标题过长时省略，不挤出齿轮/关闭按钮 */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pmg-floating-settings {
+  cursor: pointer;
+  opacity: 0.65;
+  font-size: 14px;
+  padding: 4px;
+  border-radius: 4px;
+  transition: opacity 0.15s, background-color 0.15s;
+  flex: 0 0 auto;
+}
+
+.pmg-floating-settings:hover {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .pmg-floating-close {
@@ -438,6 +500,7 @@
   padding: 4px;
   border-radius: 4px;
   transition: opacity 0.15s;
+  flex: 0 0 auto;
 }
 
 .pmg-floating-close:hover {
@@ -517,6 +580,60 @@
   gap: 6px;
 }
 
+.pmg-settings-intro {
+  opacity: 0.85;
+  line-height: 1.5;
+  margin-bottom: 4px;
+}
+
+.pmg-settings-section {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.10);
+  padding: 10px 12px;
+}
+
+.pmg-settings-section-title {
+  font-weight: 700;
+  opacity: 0.92;
+  margin-bottom: 6px;
+}
+
+.pmg-settings-op-row .pmg-settings-section-title {
+  margin-bottom: 0;
+}
+
+/* 操作行：强制横向布局（避免 flex-container 在不同主题/端侧表现为纵向） */
+.pmg-settings-op-row {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center !important;
+  gap: 10px !important;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.pmg-flex-spacer {
+  flex: 1 1 auto;
+}
+
+.pmg-settings-op-row .menu_button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.pmg-settings-drawer.inline-drawer {
+  margin-top: 8px;
+}
+
+.pmg-settings-drawer .inline-drawer-toggle.inline-drawer-header {
+  cursor: pointer;
+}
+
+.pmg-settings-drawer .inline-drawer-content {
+  margin-top: 6px;
+}
+
 .pmg-settings-row {
   display: block;
 }
@@ -524,4 +641,228 @@
 .pmg-settings-hint {
   opacity: 0.85;
   line-height: 1.5;
+}
+
+/* ========== Prompt Manager 工具栏（按钮） ========== */
+
+#completion_prompt_manager #pmg-prompt-manager-toolbar {
+  display: flex;
+  gap: 10px;
+  margin: 6px 0 10px 0;
+  width: 100%;
+}
+
+#completion_prompt_manager #pmg-prompt-manager-toolbar .menu_button {
+  flex: 1;
+  text-align: center;
+  padding-left: 10px;
+  padding-right: 10px;
+}
+
+/* ========== PMG 弹窗（独立设置 / 快速前缀编辑） ========== */
+
+.pmg-modal {
+  position: fixed;
+  inset: 0;
+  /* 用极高 z-index，避免在移动端/抽屉层级下被盖住（参考 swipe-previewer 的弹窗层级） */
+  z-index: 2147483000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px 16px;
+  box-sizing: border-box;
+  width: 100vw;
+  height: 100dvh;
+  isolation: isolate;
+}
+
+.pmg-modal.pmg-hidden {
+  display: none;
+}
+
+.pmg-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+}
+
+.pmg-modal-dialog {
+  position: relative;
+  z-index: 1;
+  width: min(820px, 100%);
+  max-height: 100%;
+  border-radius: 14px;
+  background: var(--SmartThemeBlurTintColor, rgba(30, 30, 40, 0.92));
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+
+.pmg-modal-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  flex-shrink: 0;
+}
+
+.pmg-modal-title {
+  flex: 1;
+  font-weight: 600;
+  font-size: 0.98em;
+  opacity: 0.92;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pmg-modal-close {
+  cursor: pointer;
+  opacity: 0.7;
+  font-size: 14px;
+  padding: 4px;
+  border-radius: 4px;
+  transition: opacity 0.15s;
+}
+
+.pmg-modal-close:hover {
+  opacity: 1;
+}
+
+.pmg-modal-body {
+  padding: 12px 14px;
+  overflow: auto;
+  overflow-x: hidden;
+  min-height: 0;
+  overscroll-behavior: contain;
+}
+
+@media (max-height: 720px) {
+  .pmg-modal {
+    align-items: flex-start;
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+}
+
+@media (max-width: 600px) {
+  .pmg-modal {
+    padding: 12px 10px;
+  }
+
+  .pmg-modal-dialog {
+    border-radius: 12px;
+  }
+
+  .pmg-modal-body {
+    padding: 10px 10px;
+  }
+
+  .pmg-prefix-editor-list {
+    max-height: 45vh;
+  }
+}
+
+/* ========== 快速前缀编辑器 ========== */
+
+.pmg-prefix-editor-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pmg-prefix-editor-controls .text_pole {
+  box-sizing: border-box;
+  max-width: 100%;
+}
+
+.pmg-prefix-editor-list {
+  margin-top: 10px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.12);
+  padding: 8px 10px;
+  max-height: 55vh;
+  overflow: auto;
+}
+
+.pmg-prefix-editor-item {
+  display: flex;
+  gap: 10px;
+  padding: 8px 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  cursor: pointer;
+  align-items: flex-start;
+}
+
+.pmg-prefix-editor-item:last-child {
+  border-bottom: none;
+}
+
+.pmg-prefix-editor-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.pmg-prefix-editor-item-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.pmg-prefix-editor-item-title {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pmg-prefix-editor-item-sub {
+  margin-top: 2px;
+  font-size: 0.86em;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.pmg-prefix-editor-item-sub .pmg-pe-label,
+.pmg-prefix-editor-item-sub .pmg-pe-arrow {
+  opacity: 0.65;
+}
+
+.pmg-prefix-editor-item-sub .pmg-pe-no-prefix {
+  opacity: 0.75;
+  font-style: italic;
+}
+
+.pmg-prefix-editor-item-sub .pmg-pe-g1 {
+  color: #f1c40f;
+  font-weight: 600;
+}
+
+.pmg-prefix-editor-item-sub .pmg-pe-g2 {
+  color: #5dade2;
+  font-weight: 600;
+}
+
+.pmg-prefix-editor-item-sub .pmg-pe-leaf {
+  opacity: 0.92;
+}
+
+.pmg-prefix-editor-status {
+  opacity: 0.85;
+  font-size: 0.9em;
+  line-height: 1.4;
+}
+
+.pmg-prefix-editor-empty {
+  opacity: 0.75;
+  padding: 10px 4px;
+  text-align: center;
 }
