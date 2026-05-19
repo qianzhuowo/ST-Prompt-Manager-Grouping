@@ -5,6 +5,6 @@
   "js": "index.js",
   "css": "style.css",
   "author": "Qianzhuo",
-  "version": "1.3.15",
-  "description": "对 SillyTavern 的预设列表提供分组/收藏快捷栏（依赖 ST API Wrapper 提供的 window.ST_API）。"
+  "version": "2.0.0",
+  "description": "对 SillyTavern 的预设列表提供分组/收藏快捷栏；增强原生 OpenAI 预设下拉栏，支持收藏置顶和无需切换的预设管理操作（前置依赖插件 ST API Wrapper ）。"
 }

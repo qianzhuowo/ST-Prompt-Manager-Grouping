@@ -6,11 +6,9 @@
  * - 分组标题支持收起/展开
  * - 支持隐藏前缀（仅显示，不修改原始 prompt 名称/数据）
  * - 支持收藏（一级/二级/单独条目）+ 内联收藏面板 + 独立浮动收藏快捷栏
- * - 分组开启时禁用酒馆原生拖拽（sortable）
- * - 通过 MutationObserver 监听 UI 刷新，自动重复注入
- * - 防刷新：通过 PromptManager.prototype.render 补丁，在 toggle 时跳过昂贵的 dry-run
+ * - 可选禁用酒馆原生拖拽（sortable），避免分组视图被原生排序打乱
  *
- * 依赖：st-api-wrapper（window.ST_API）
+ * 前置依赖插件：st-api-wrapper（window.ST_API）
  */
 
 (function PromptManagerGroupingIIFE() {
@@ -39,6 +37,16 @@
   let applying = false;
   let applyTimer = null;
 
+  // 拖拽排序性能保护：拖拽过程中 jQuery UI sortable 会产生大量 childList mutation。
+  // 如果每次 mutation 都触发 PMG 重分组 / 收藏栏刷新，会导致明显卡顿。
+  let promptListDragActive = false;
+  let promptListDragSettleTimer = null;
+  let pendingApplyAfterPromptDrag = false;
+  let pendingApplyAfterPromptDragReason = '';
+  let forceRegroupAfterPromptDrag = false;
+  let promptListDragStartedBySortable = false;
+  let suppressListMutationUntil = 0;
+
   // ---------------------------------------------------------------------------
   // Utils
   // ---------------------------------------------------------------------------
@@ -59,23 +67,93 @@
     }
   }
 
+  function isDelayableApplyReasonDuringPromptDrag(reason) {
+    const r = String(reason || '');
+    return (
+      r.includes('list-mutation') ||
+      r.includes('body-mutation') ||
+      r.includes('attach') ||
+      r.includes('native-sortable') ||
+      r.includes('prompt-drag')
+    );
+  }
+
+  function markApplyPendingAfterPromptDrag(reason) {
+    pendingApplyAfterPromptDrag = true;
+    pendingApplyAfterPromptDragReason = String(reason || pendingApplyAfterPromptDragReason || 'prompt-drag');
+  }
+
+  function suppressOwnListMutations(durationMs = 180) {
+    suppressListMutationUntil = Math.max(suppressListMutationUntil, Date.now() + durationMs);
+  }
+
+  function isOwnListMutationSuppressed() {
+    return Date.now() < suppressListMutationUntil;
+  }
+
   function debounceApply(reason, delayMs = 80) {
+    if (promptListDragActive && isDelayableApplyReasonDuringPromptDrag(reason)) {
+      markApplyPendingAfterPromptDrag(reason);
+      return;
+    }
+
     if (applyTimer) clearTimeout(applyTimer);
     applyTimer = setTimeout(() => {
       applyTimer = null;
+      if (promptListDragActive && isDelayableApplyReasonDuringPromptDrag(reason)) {
+        markApplyPendingAfterPromptDrag(reason);
+        return;
+      }
       // 先刷新当前预设名称（用于按预设隔离收藏），再应用 UI
       void applyAllWithPresetCheck(reason);
     }, delayMs);
   }
 
+  function beginPromptListDrag(reason = 'prompt-drag-start', options = {}) {
+    promptListDragActive = true;
+    if (options.sortableStarted) promptListDragStartedBySortable = true;
+    if (promptListDragSettleTimer) {
+      clearTimeout(promptListDragSettleTimer);
+      promptListDragSettleTimer = null;
+    }
+    if (options.markPending !== false) markApplyPendingAfterPromptDrag(reason);
+    if (currentListEl instanceof HTMLElement) currentListEl.dataset.pmgPromptDragActive = '1';
+  }
+
+  function endPromptListDrag(reason = 'prompt-drag-stop') {
+    if (!promptListDragActive && !pendingApplyAfterPromptDrag) return;
+
+    if (promptListDragSettleTimer) clearTimeout(promptListDragSettleTimer);
+    // update / stop / DOM settle 的触发顺序在不同 jQuery UI 版本中略有差异，延迟一小段时间再统一刷新。
+    promptListDragSettleTimer = setTimeout(() => {
+      promptListDragSettleTimer = null;
+      promptListDragActive = false;
+      if (currentListEl instanceof HTMLElement) delete currentListEl.dataset.pmgPromptDragActive;
+
+      const pendingReason = pendingApplyAfterPromptDragReason || reason;
+      const shouldFlushAfterDrag = pendingApplyAfterPromptDrag || promptListDragStartedBySortable;
+      pendingApplyAfterPromptDrag = false;
+      pendingApplyAfterPromptDragReason = '';
+      promptListDragStartedBySortable = false;
+
+      if (!shouldFlushAfterDrag) return;
+      forceRegroupAfterPromptDrag = true;
+
+      // 拖拽结束后只做一次重分组/折叠/收藏栏刷新，避免拖拽过程中连续重建 DOM。
+      debounceApply(`${pendingReason}-settled`, 0);
+    }, 120);
+  }
+
   function createDefaultConfig() {
     return {
-      version: 5,
+      version: 8,
 
       // 分组
       groupingEnabled: true,
       secondLevelEnabled: true,
       hidePrefixes: true,
+      // 是否禁用 SillyTavern 原生 Prompt Manager 拖拽排序（独立于分组开关）
+      disableNativeDragWhenGrouped: true,
 
       // 前缀解析规则
       prefixBracketEnabled: true,
@@ -110,6 +188,8 @@
       // 浮动收藏快捷栏（独立于预设面板）
       floatingPanelEnabled: true,
       floatingPanelExpanded: false,
+      // 浮动面板当前页签：favorites=收藏条目，presets=收藏预设
+      floatingPanelActiveTab: 'favorites',
 
       // 浮动元素位置（null = 使用默认 CSS 位置；拖拽后保存，兼容：
       // - 旧格式：{ left, top }
@@ -155,6 +235,24 @@
       // 设置页折叠栏展开状态（记忆上次状态）
       // { [drawerKey: string]: boolean }
       settingsDrawerExpanded: {},
+
+      // ---------------------------------------------------------------------
+      // 原生预设界面统一卷轴折叠（聊天补全设置面板内若干常用区域）
+      // ---------------------------------------------------------------------
+      // 是否启用该功能（总开关，默认开启）
+      nativePanelCollapseEnabled: true,
+      // 统一卷轴折叠状态：true=折叠，false/缺省=展开
+      // { [regionId: string]: boolean }
+      // regionId: 'nativePresetRoll'
+      nativePanelCollapsed: {},
+
+      // ---------------------------------------------------------------------
+      // 原生 OpenAI 预设下拉栏增强（#settings_preset_openai）
+      // ---------------------------------------------------------------------
+      // 收藏的预设会在原生下拉栏中置顶；增强管理面板支持不切换预设直接改名/导出/删除/另存为。
+      nativePresetEnhancedEnabled: true,
+      nativePresetFavorites: [],
+
     };
   }
 
@@ -172,6 +270,7 @@
       'groupingEnabled',
       'secondLevelEnabled',
       'hidePrefixes',
+      'disableNativeDragWhenGrouped',
       'prefixBracketEnabled',
       'prefixDashEnabled',
       'prefixCustomWrapperEnabled',
@@ -186,6 +285,7 @@
       'favoritesPanelExpanded',
       'floatingPanelEnabled',
       'floatingPanelExpanded',
+      'floatingPanelActiveTab',
       'floatingTogglePos',
       'floatingPanelPos',
       'favoritesExpandGroupsByDefault',
@@ -199,6 +299,10 @@
       'collapsedByPreset',
       'legacyCollapsedMigrated',
       'settingsDrawerExpanded',
+      'nativePanelCollapseEnabled',
+      'nativePanelCollapsed',
+      'nativePresetEnhancedEnabled',
+      'nativePresetFavorites',
     ];
 
     for (const k of keys) {
@@ -252,6 +356,39 @@
 
     if (!out.settingsDrawerExpanded || typeof out.settingsDrawerExpanded !== 'object' || Array.isArray(out.settingsDrawerExpanded)) {
       out.settingsDrawerExpanded = {};
+    }
+
+    if (typeof out.nativePanelCollapseEnabled !== 'boolean') {
+      out.nativePanelCollapseEnabled = true;
+    }
+    if (!out.nativePanelCollapsed || typeof out.nativePanelCollapsed !== 'object' || Array.isArray(out.nativePanelCollapsed)) {
+      out.nativePanelCollapsed = {};
+    } else {
+      // 规范化为布尔值
+      const cleaned = {};
+      for (const [k, v] of Object.entries(out.nativePanelCollapsed)) {
+        cleaned[String(k)] = !!v;
+      }
+
+      // 如果用户旧配置里有任一区域处于折叠状态，则迁移为统一卷轴折叠，尽量保留用户意图。
+      if (!('nativePresetRoll' in cleaned)) {
+        const legacyRegionIds = ['chatBehavior', 'quickPrompts', 'utilityPrompts', 'seed', 'logitBias'];
+        if (legacyRegionIds.some((id) => cleaned[id])) {
+          cleaned.nativePresetRoll = true;
+        }
+      }
+      out.nativePanelCollapsed = cleaned;
+    }
+
+    if (typeof out.nativePresetEnhancedEnabled !== 'boolean') {
+      out.nativePresetEnhancedEnabled = true;
+    }
+    if (!Array.isArray(out.nativePresetFavorites)) {
+      out.nativePresetFavorites = [];
+    }
+
+    if (out.floatingPanelActiveTab !== 'favorites' && out.floatingPanelActiveTab !== 'presets') {
+      out.floatingPanelActiveTab = 'favorites';
     }
 
     // 嵌入模式下的按钮顺序记忆
@@ -312,176 +449,419 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Block SillyTavern preset UI refresh on prompt toggle
-  // (via PromptManager.prototype.render patch)
+  // Native PromptManager enhancement patch
   //
-  // 说明：
-  // 酒馆在 toggle prompt 开关后会调用 PromptManager.render(true)，
-  // 其中 render(true) 会先执行 tryGenerate()（dry-run token 计数，触发大量网络请求），
-  // 再重建整个 prompt 列表 DOM。这导致：
-  //   1. 体感卡顿（等待 token 计数）
-  //   2. 注入的分组头被销毁
-  //
-  // 方案：直接 monkey-patch PromptManager.prototype.render，
-  // 在"冻结"期间将 render(true) 降级为 render(false)（仅更新 UI，不做 dry-run）。
-  // 当用户点击 Prompt Manager 以外的区域时，解除冻结并补做一次 render(true)。
-  //
-  // 优势（相比 emit 补丁）：
-  //   - 不干扰全局事件系统
-  //   - 精确针对 PromptManager 的渲染路径
+  // 不再代理/隐藏原生列表，而是 patch PromptManager 的原生渲染方法：
+  // - renderPromptManagerListItems：直接渲染 PMG 分组标题 + 原生 prompt 条目
+  // - init：增强实例 handleToggle，阻止单条开关触发 PromptManager.render() 重建 DOM
   // ---------------------------------------------------------------------------
+
+  const INJECTION_POSITION_ABSOLUTE = 1;
 
   /** @type {null | {
    *  installed: boolean;
-   *  prevRender: Function;
-   *  patchedRender: Function;
-   *  freezeActive: boolean;
-   *  pendingDryRun: boolean;
-   *  pendingInstance: any;
-   *  outsideClickHandler: ((e: MouseEvent) => void) | null;
+   *  proto: any;
+   *  originalRenderPromptManagerListItems: Function;
+   *  originalInit: Function|null;
+   *  originalMakeDraggable: Function|null;
+   *  lastInstance: any;
    * }} */
-  let renderPatchState = null;
+  let promptManagerNativePatchState = null;
 
-  async function installRenderPatch() {
-    if (renderPatchState?.installed) return;
-    if (!config.blockPresetUiRefreshOnToggle) return;
+  function escapeHtmlLocal(value) {
+    const div = document.createElement('div');
+    div.textContent = String(value ?? '');
+    return div.innerHTML;
+  }
+
+  function escapeAttrLocal(value) {
+    return escapeHtmlLocal(value).replace(/`/g, '&#96;');
+  }
+
+  async function installPromptManagerNativePatch() {
+    if (promptManagerNativePatchState?.installed) return;
 
     let mod;
     try {
       mod = await import('/scripts/PromptManager.js');
     } catch (e) {
-      warn('Failed to import PromptManager.js for render patch:', e);
+      warn('Failed to import PromptManager.js for native patch:', e);
       return;
     }
 
     const PromptManager = mod?.PromptManager;
     const proto = PromptManager?.prototype;
-    if (!proto || typeof proto.render !== 'function') {
-      warn('PromptManager.prototype.render not found');
+    if (!proto || typeof proto.renderPromptManagerListItems !== 'function') {
+      warn('PromptManager.prototype.renderPromptManagerListItems not found');
       return;
     }
 
-    // 避免重复 patch
-    if (proto.render.__pmgRenderPatched) {
-      renderPatchState = {
+    if (proto.renderPromptManagerListItems.__pmgNativePatched) {
+      promptManagerNativePatchState = {
         installed: true,
-        prevRender: proto.render.__pmgPrevRender || proto.render,
-        patchedRender: proto.render,
-        freezeActive: false,
-        pendingDryRun: false,
-        pendingInstance: null,
-        outsideClickHandler: null,
+        proto,
+        originalRenderPromptManagerListItems: proto.renderPromptManagerListItems.__pmgOriginalRenderPromptManagerListItems || proto.renderPromptManagerListItems,
+        originalInit: proto.init?.__pmgOriginalInit || null,
+        originalMakeDraggable: proto.makeDraggable?.__pmgOriginalMakeDraggable || null,
+        lastInstance: null,
       };
-      installOutsideClickForRenderPatch();
       return;
     }
 
-    const prevRender = proto.render;
+    const originalRenderPromptManagerListItems = proto.renderPromptManagerListItems;
+    const originalInit = typeof proto.init === 'function' ? proto.init : null;
+    const originalMakeDraggable = typeof proto.makeDraggable === 'function' ? proto.makeDraggable : null;
 
-    const state = {
-      installed: true,
-      prevRender,
-      patchedRender: null,
-      freezeActive: false,
-      pendingDryRun: false,
-      pendingInstance: null,
-      outsideClickHandler: null,
-    };
-
-    // 找到最原始的 render（穿过 cocktail 的 wrapper）
-    const trueOriginal =
-      prevRender.__stPresetPanelOptimizerOriginalRender ||
-      prevRender.__pmgPrevRender ||
-      prevRender;
-
-    state.patchedRender = function pmgPatchedRender(afterTryGenerate = true) {
-      if (state.freezeActive && afterTryGenerate && config.blockPresetUiRefreshOnToggle) {
-        // 降级：跳过 tryGenerate (dry-run)，仅渲染 UI
-        try {
-          trueOriginal.call(this, false);
-        } catch (e) {
-          return prevRender.call(this, afterTryGenerate);
+    proto.renderPromptManagerListItems = async function pmgNativeRenderPromptManagerListItems() {
+      if (!config.groupingEnabled) {
+        if (this.listElement instanceof HTMLElement) {
+          delete this.listElement.dataset.pmgNativeRendered;
         }
-        state.pendingDryRun = true;
-        state.pendingInstance = this;
-        return;
+        return originalRenderPromptManagerListItems.call(this);
       }
-      return prevRender.call(this, afterTryGenerate);
+
+      promptManagerNativePatchState && (promptManagerNativePatchState.lastInstance = this);
+      return renderPromptManagerListItemsWithPmgGroups.call(this);
     };
+    proto.renderPromptManagerListItems.__pmgNativePatched = true;
+    proto.renderPromptManagerListItems.__pmgOriginalRenderPromptManagerListItems = originalRenderPromptManagerListItems;
 
-    state.patchedRender.__pmgRenderPatched = true;
-    state.patchedRender.__pmgPrevRender = prevRender;
-
-    // 保留 cocktail 的标记
-    if (prevRender.__stPresetPanelOptimizerPatched) {
-      state.patchedRender.__stPresetPanelOptimizerPatched = true;
-      state.patchedRender.__stPresetPanelOptimizerOriginalRender =
-        prevRender.__stPresetPanelOptimizerOriginalRender;
+    if (originalInit && !proto.init.__pmgInitPatched) {
+      proto.init = function pmgPatchedPromptManagerInit(...args) {
+        const result = originalInit.apply(this, args);
+        patchPromptManagerInstanceToggle(this);
+        return result;
+      };
+      proto.init.__pmgInitPatched = true;
+      proto.init.__pmgOriginalInit = originalInit;
     }
 
-    proto.render = state.patchedRender;
-    renderPatchState = state;
+    if (originalMakeDraggable && !proto.makeDraggable.__pmgMakeDraggablePatched) {
+      proto.makeDraggable = function pmgPatchedMakeDraggable(...args) {
+        promptManagerNativePatchState && (promptManagerNativePatchState.lastInstance = this);
+        const list = this.listElement || document.getElementById(this.configuration.prefix + 'prompt_manager_list');
+        if (config.disableNativeDragWhenGrouped) {
+          if (list instanceof HTMLElement) disableNativeSortable(list);
+          return;
+        }
+        const result = originalMakeDraggable.apply(this, args);
+        if (list instanceof HTMLElement) enableNativeSortable(list);
+        return result;
+      };
+      proto.makeDraggable.__pmgMakeDraggablePatched = true;
+      proto.makeDraggable.__pmgOriginalMakeDraggable = originalMakeDraggable;
+    }
 
-    installOutsideClickForRenderPatch();
-    log('PromptManager.render patched for anti-refresh');
-  }
-
-  function installOutsideClickForRenderPatch() {
-    if (!renderPatchState || renderPatchState.outsideClickHandler) return;
-
-    renderPatchState.outsideClickHandler = (e) => {
-      if (!renderPatchState?.freezeActive) return;
-
-      const pm = getPromptManagerContainer();
-      const target = e.target;
-      if (pm && target instanceof Node && pm.contains(target)) return;
-
-      renderPatchState.freezeActive = false;
-
-      if (renderPatchState.pendingDryRun && renderPatchState.pendingInstance) {
-        const inst = renderPatchState.pendingInstance;
-        renderPatchState.pendingDryRun = false;
-        renderPatchState.pendingInstance = null;
-        setTimeout(() => {
-          try {
-            renderPatchState.prevRender.call(inst, true);
-          } catch {
-            // ignore
-          }
-        }, 0);
-      }
+    promptManagerNativePatchState = {
+      installed: true,
+      proto,
+      originalRenderPromptManagerListItems,
+      originalInit,
+      originalMakeDraggable,
+      lastInstance: null,
     };
 
-    document.addEventListener('click', renderPatchState.outsideClickHandler, true);
+    log('PromptManager native render patched');
   }
 
-  function uninstallRenderPatch() {
-    const state = renderPatchState;
+  function uninstallPromptManagerNativePatch() {
+    const state = promptManagerNativePatchState;
     if (!state?.installed) return;
+    // 不主动恢复 prototype，避免破坏其他插件链式 patch；只关闭 PMG 原生增强行为。
+    config.groupingEnabled = false;
+    promptManagerNativePatchState = null;
+  }
+
+  function patchPromptManagerInstanceToggle(instance) {
+    if (!instance || instance.__pmgTogglePatched) return;
+    const originalHandleToggle = instance.handleToggle;
+    if (typeof originalHandleToggle !== 'function') return;
+
+    instance.handleToggle = function pmgInstanceHandleToggle(event) {
+      if (!config.blockPresetUiRefreshOnToggle) {
+        return originalHandleToggle.call(this, event);
+      }
+      return handlePromptToggleWithoutRender.call(instance, event);
+    };
+    instance.handleToggle.__pmgOriginalHandleToggle = originalHandleToggle;
+    instance.__pmgTogglePatched = true;
+  }
+
+  function handlePromptToggleWithoutRender(event) {
+    const target = event?.target;
+    if (!(target instanceof HTMLElement)) return;
+    const promptLi = target.closest('.' + this.configuration.prefix + 'prompt_manager_prompt');
+    const promptID = promptLi?.dataset?.pmIdentifier;
+    if (!promptID) return;
+
+    const promptOrderEntry = this.getPromptOrderEntry(this.activeCharacter, promptID);
+    if (!promptOrderEntry) return;
+
+    const counts = this.tokenHandler?.getCounts?.();
+    if (counts) counts[promptID] = null;
+
+    promptOrderEntry.enabled = !promptOrderEntry.enabled;
+    updatePromptToggleDom(this, promptID, promptOrderEntry.enabled);
 
     try {
-      if (state.outsideClickHandler) {
-        document.removeEventListener('click', state.outsideClickHandler, true);
+      this.saveServiceSettings();
+    } catch (e) {
+      warn('Failed to save prompt toggle state:', e);
+    }
+
+    setTimeout(renderAllFavoritesPanels, 30);
+  }
+
+  function updatePromptToggleDom(pm, promptID, enabled) {
+    const list = pm?.listElement || findPromptManagerList();
+    if (!list) return;
+    const selector = `.${pm.configuration.prefix}prompt_manager_prompt[data-pm-identifier="${cssEscapeCompat(promptID)}"]`;
+    const disabledClass = `${pm.configuration.prefix}prompt_manager_prompt_disabled`;
+    for (const li of Array.from(list.querySelectorAll(selector))) {
+      if (!(li instanceof HTMLElement)) continue;
+      li.classList.toggle(disabledClass, !enabled);
+      const toggle = li.querySelector('.prompt-manager-toggle-action');
+      if (toggle) {
+        toggle.classList.toggle('fa-toggle-on', enabled);
+        toggle.classList.toggle('fa-toggle-off', !enabled);
       }
-    } catch {
-      // ignore
+    }
+  }
+
+  function buildPromptManagerListHeaderHtml(prefix) {
+    return `
+      <li class="${escapeAttrLocal(prefix)}prompt_manager_list_head">
+        <span data-i18n="Name">Name</span>
+        <span></span>
+        <span class="prompt_manager_prompt_tokens" data-i18n="Tokens;prompt_manager_tokens">Tokens</span>
+      </li>
+      <li class="${escapeAttrLocal(prefix)}prompt_manager_list_separator"><hr></li>
+    `;
+  }
+
+  function buildPromptItemHtml(pm, prompt, parsed) {
+    const { prefix } = pm.configuration;
+    const listEntry = pm.getPromptOrderEntry(pm.activeCharacter, prompt.identifier);
+    if (!listEntry) return '';
+
+    const enabledClass = listEntry.enabled ? '' : `${prefix}prompt_manager_prompt_disabled`;
+    const draggableClass = `${prefix}prompt_manager_prompt_draggable`;
+    const markerClass = prompt.marker ? `${prefix}prompt_manager_marker` : '';
+    const tokens = pm.tokenHandler?.getCounts?.()[prompt.identifier] ?? 0;
+
+    let warningClass = '';
+    let warningTitle = '';
+    const tokenBudget = Number(pm.serviceSettings.openai_max_context || 0) - Number(pm.serviceSettings.openai_max_tokens || 0);
+    if (pm.tokenUsage > tokenBudget * 0.8 && prompt.identifier === 'chatHistory') {
+      const warningThreshold = pm.configuration.warningTokenThreshold;
+      const dangerThreshold = pm.configuration.dangerTokenThreshold;
+      if (tokens <= dangerThreshold) {
+        warningClass = 'fa-solid tooltip fa-triangle-exclamation text_danger';
+        warningTitle = 'Very little of your chat history is being sent, consider deactivating some other prompts.';
+      } else if (tokens <= warningThreshold) {
+        warningClass = 'fa-solid tooltip fa-triangle-exclamation text_warning';
+        warningTitle = 'Only a few messages worth chat history are being sent.';
+      }
     }
 
-    // 不强行恢复 prototype（其他插件可能也 wrap 了），只让冻结逻辑失效
-    if (state.patchedRender) {
-      state.patchedRender.__pmgDisabled = true;
-    }
+    const calculatedTokens = tokens ? tokens : '-';
+    const detachSpanHtml = pm.isPromptDeletionAllowed(prompt)
+      ? '<span title="Remove" class="prompt-manager-detach-action caution fa-solid fa-chain-broken fa-xs"></span>'
+      : '<span class="fa-solid"></span>';
+    const editSpanHtml = pm.isPromptEditAllowed(prompt)
+      ? '<span title="edit" class="prompt-manager-edit-action fa-solid fa-pencil fa-xs"></span>'
+      : '<span class="fa-solid"></span>';
+    const toggleSpanHtml = pm.isPromptToggleAllowed(prompt)
+      ? `<span class="prompt-manager-toggle-action ${listEntry.enabled ? 'fa-solid fa-toggle-on' : 'fa-solid fa-toggle-off'}"></span>`
+      : '<span class="fa-solid"></span>';
 
-    renderPatchState = null;
+    const originalName = String(prompt.name ?? '');
+    const displayName = config.hidePrefixes && parsed?.hasPrefix ? (parsed.leaf || originalName) : originalName;
+    const encodedName = escapeHtmlLocal(displayName);
+    const encodedOriginalName = escapeAttrLocal(originalName);
+    const encodedIdentifier = escapeAttrLocal(prompt.identifier);
+    const isMarkerPrompt = prompt.marker && prompt.injection_position !== INJECTION_POSITION_ABSOLUTE;
+    const isSystemPrompt = !prompt.marker && prompt.system_prompt && prompt.injection_position !== INJECTION_POSITION_ABSOLUTE && !prompt.forbid_overrides;
+    const isImportantPrompt = !prompt.marker && prompt.system_prompt && prompt.injection_position !== INJECTION_POSITION_ABSOLUTE && prompt.forbid_overrides;
+    const isUserPrompt = !prompt.marker && !prompt.system_prompt && prompt.injection_position !== INJECTION_POSITION_ABSOLUTE;
+    const isInjectionPrompt = prompt.injection_position === INJECTION_POSITION_ABSOLUTE;
+    const isOverriddenPrompt = Array.isArray(pm.overriddenPrompts) && pm.overriddenPrompts.includes(prompt.identifier);
+    const importantClass = isImportantPrompt ? `${prefix}prompt_manager_important` : '';
+    const iconLookup = prompt.role === 'system' && (prompt.marker || prompt.system_prompt) ? '' : prompt.role;
+    const promptRoles = {
+      assistant: { roleIcon: 'fa-robot', roleTitle: 'Prompt will be sent as Assistant' },
+      user: { roleIcon: 'fa-user', roleTitle: 'Prompt will be sent as User' },
+    };
+    const roleIcon = promptRoles[iconLookup]?.roleIcon || '';
+    const roleTitle = promptRoles[iconLookup]?.roleTitle || '';
+    const depthText = prompt.injection_depth ?? '';
+
+    return `
+      <li class="${escapeAttrLocal(prefix)}prompt_manager_prompt ${escapeAttrLocal(draggableClass)} ${escapeAttrLocal(enabledClass)} ${escapeAttrLocal(markerClass)} ${escapeAttrLocal(importantClass)}" data-pm-identifier="${encodedIdentifier}">
+        <span class="drag-handle">☰</span>
+        <span class="${escapeAttrLocal(prefix)}prompt_manager_prompt_name" data-pm-name="${encodedOriginalName}">
+          ${isMarkerPrompt ? '<span class="fa-fw fa-solid fa-thumb-tack" title="Marker"></span>' : ''}
+          ${isSystemPrompt ? '<span class="fa-fw fa-solid fa-square-poll-horizontal" title="Global Prompt"></span>' : ''}
+          ${isImportantPrompt ? '<span class="fa-fw fa-solid fa-star" title="Important Prompt"></span>' : ''}
+          ${isUserPrompt ? '<span class="fa-fw fa-solid fa-asterisk" title="Preset Prompt"></span>' : ''}
+          ${isInjectionPrompt ? '<span class="fa-fw fa-solid fa-syringe" title="In-Chat Injection"></span>' : ''}
+          ${pm.isPromptInspectionAllowed(prompt) ? `<a title="${encodedOriginalName}" class="prompt-manager-inspect-action">${encodedName}</a>` : `<span title="${encodedOriginalName}">${encodedName}</span>`}
+          ${roleIcon ? `<span data-role="${escapeAttrLocal(prompt.role)}" class="fa-xs fa-solid ${escapeAttrLocal(roleIcon)}" title="${escapeAttrLocal(roleTitle)}"></span>` : ''}
+          ${isInjectionPrompt ? `<small class="prompt-manager-injection-depth">@ ${escapeHtmlLocal(depthText)}</small>` : ''}
+          ${isOverriddenPrompt ? '<small class="fa-solid fa-address-card prompt-manager-overridden" title="Pulled from a character card"></small>' : ''}
+        </span>
+        <span>
+          <span class="prompt_manager_prompt_controls">
+            ${detachSpanHtml}
+            ${editSpanHtml}
+            ${toggleSpanHtml}
+          </span>
+        </span>
+        <span class="prompt_manager_prompt_tokens" data-pm-tokens="${escapeAttrLocal(calculatedTokens)}"><span class="${escapeAttrLocal(warningClass)}" title="${escapeAttrLocal(warningTitle)}"> </span>${escapeHtmlLocal(calculatedTokens)}</span>
+      </li>
+    `;
+  }
+
+  function bindPromptManagerListEvents(pm, promptManagerList) {
+    Array.from(promptManagerList.getElementsByClassName('prompt-manager-detach-action')).forEach(el => {
+      el.addEventListener('click', pm.handleDetach);
+    });
+    Array.from(promptManagerList.getElementsByClassName('prompt-manager-inspect-action')).forEach(el => {
+      el.addEventListener('click', pm.handleInspect);
+    });
+    Array.from(promptManagerList.getElementsByClassName('prompt-manager-edit-action')).forEach(el => {
+      el.addEventListener('click', pm.handleEdit);
+    });
+    Array.from(promptManagerList.querySelectorAll('.prompt-manager-toggle-action')).forEach(el => {
+      el.addEventListener('click', config.blockPresetUiRefreshOnToggle ? (event) => handlePromptToggleWithoutRender.call(pm, event) : pm.handleToggle);
+    });
+  }
+
+  async function renderPromptManagerListItemsWithPmgGroups() {
+    if (!this.serviceSettings?.prompts) return;
+    patchPromptManagerInstanceToggle(this);
+
+    promptManagerNativePatchState && (promptManagerNativePatchState.lastInstance = this);
+
+    const promptManagerList = this.listElement;
+    if (!promptManagerList) return;
+    currentListEl = promptManagerList;
+
+    suppressOwnListMutations(220);
+    promptManagerList.dataset.pmgNativeRendered = '1';
+    promptManagerList.innerHTML = '';
+
+    const { prefix } = this.configuration;
+    promptManagerList.insertAdjacentHTML('beforeend', buildPromptManagerListHeaderHtml(prefix));
+    const fragment = document.createDocumentFragment();
+
+    const prefixRules = buildPrefixParseRules();
+    let currentGroup1 = null;
+    let currentGroup2 = null;
+    let currentGroupId = null;
+    const group1OccCount = {};
+    const group2OccCount = {};
+
+    const appendPromptHtml = (prompt, parsed) => {
+      const html = buildPromptItemHtml(this, prompt, parsed);
+      if (!html) return null;
+      const template = document.createElement('template');
+      template.innerHTML = html.trim();
+      const li = template.content.firstElementChild;
+      if (li instanceof HTMLElement) {
+        fragment.appendChild(li);
+        if (config.favoritesEnabled) ensureItemFavoriteButton(li);
+      }
+      return li;
+    };
+
+    this.getPromptsForCharacter(this.activeCharacter).forEach(prompt => {
+      if (!prompt) return;
+      const originalName = String(prompt.name ?? '');
+      const parsed = parsePromptName(originalName, config.secondLevelEnabled, prefixRules);
+
+      if (!parsed.hasPrefix) {
+        currentGroup1 = null;
+        currentGroup2 = null;
+        currentGroupId = null;
+        const li = appendPromptHtml(prompt, parsed);
+        if (li) {
+          li.dataset.pmgHasPrefix = '0';
+          li.classList.add('pmg-item-standalone');
+        }
+        return;
+      }
+
+      const g1 = parsed.group1;
+      const g2 = parsed.group2;
+
+      if (g1 && g1 !== currentGroup1) {
+        const occ = group1OccCount[g1] || 0;
+        group1OccCount[g1] = occ + 1;
+        currentGroupId = buildGroup1Id(g1, occ);
+        const header1Title = occ > 0 ? `${g1} (${occ + 1})` : g1;
+        fragment.appendChild(createGroupHeaderLi({ level: 1, group1: g1, groupId: currentGroupId, displayTitle: header1Title }));
+        currentGroup1 = g1;
+        currentGroup2 = null;
+      }
+
+      let group2Id = null;
+      if (config.secondLevelEnabled && g1 && g2) {
+        const g2CounterKey = `${String(currentGroupId)}|||${String(g2)}`;
+        if (!(g2CounterKey in group2OccCount)) group2OccCount[g2CounterKey] = 0;
+        if (g2 !== currentGroup2) group2OccCount[g2CounterKey] += 1;
+        const effectiveG2Occ = Math.max(0, (group2OccCount[g2CounterKey] || 1) - 1);
+        group2Id = buildGroup2Id(currentGroupId, g2, effectiveG2Occ);
+
+        if (g2 !== currentGroup2) {
+          const header2Title = effectiveG2Occ > 0 ? `${g2} (${effectiveG2Occ + 1})` : g2;
+          fragment.appendChild(createGroupHeaderLi({ level: 2, group1: g1, group2: g2, groupId: currentGroupId, group2Id, displayTitle: header2Title }));
+          currentGroup2 = g2;
+        }
+      } else {
+        currentGroup2 = null;
+      }
+
+      const li = appendPromptHtml(prompt, parsed);
+      if (li) {
+        li.dataset.pmgHasPrefix = '1';
+        li.dataset.pmgGroup1 = g1;
+        li.dataset.pmgGroupId = currentGroupId;
+        li.classList.add('pmg-in-group1');
+        if (group2Id && g2) {
+          li.dataset.pmgGroup2 = g2;
+          li.dataset.pmgGroup2Id = group2Id;
+          li.classList.add('pmg-in-group2');
+        }
+      }
+    });
+
+    promptManagerList.appendChild(fragment);
+
+    bindPromptManagerListEvents(this, promptManagerList);
+    applyNativeDragState(promptManagerList);
+    applyCollapseVisibility();
   }
 
   function activateRenderFreeze() {
-    if (!config.blockPresetUiRefreshOnToggle) return;
-    if (!renderPatchState?.installed) {
-      installRenderPatch();
+    // 兼容旧调用点：native patch 下开关由 handlePromptToggleWithoutRender 处理，不再需要冻结 render。
+    if (!promptManagerNativePatchState?.installed) {
+      void installPromptManagerNativePatch();
     }
-    if (!renderPatchState?.installed) return;
-    renderPatchState.freezeActive = true;
+  }
+
+  function requestPromptManagerNativeRender(afterTryGenerate = false) {
+    const inst = promptManagerNativePatchState?.lastInstance;
+    if (!inst || typeof inst.render !== 'function') return false;
+    setTimeout(() => {
+      try {
+        inst.render(afterTryGenerate);
+      } catch (e) {
+        warn('PromptManager native render request failed:', e);
+        debounceApply('native-render-fallback', 0);
+      }
+    }, 0);
+    return true;
   }
 
   // ---------------------------------------------------------------------------
@@ -831,6 +1211,9 @@
 
       config = mergeConfig(createDefaultConfig(), loaded);
 
+      // 性能优化已固定默认开启，不再允许通过设置页关闭。
+      config.blockPresetUiRefreshOnToggle = true;
+
       // legacy
       config.favorites.group1 = ensureArrayUnique(config.favorites.group1);
       config.favorites.group2 = ensureArrayUnique(config.favorites.group2);
@@ -873,30 +1256,39 @@
         config.favoritesExpandedByPreset[pn] = s;
       }
 
+      config.nativePresetFavorites = ensureArrayUnique(config.nativePresetFavorites).map(String).filter(Boolean);
+
       log('Config loaded:', config);
 
-      // localStorage 兜底：浮动按钮/面板位置 & 嵌入模式顺序
+      // localStorage 兜底：快捷收藏栏 UI 状态、浮动按钮/面板位置 & 嵌入模式顺序
+      restoreQuickFavoritesUiStateFromLocalStorageIfNeeded();
       restoreQuickFavoritesPosFromLocalStorageIfNeeded();
       restoreQuickFavoritesEmbeddedIndexFromLocalStorageIfNeeded();
+      restoreNoRefreshUiStateFromLocalStorageIfNeeded();
 
       // 尝试补一次迁移（如果已能拿到预设名）
       try { await refreshActivePresetName(false); } catch { /* ignore */ }
     } catch (e) {
       warn('Config load failed, using defaults:', e);
       config = createDefaultConfig();
+      config.blockPresetUiRefreshOnToggle = true;
 
-      // localStorage 兜底：即使整体配置加载失败，也尽量恢复“拖拽位置”
+      // localStorage 兜底：即使整体配置加载失败，也尽量恢复快捷收藏栏 UI 状态 / 拖拽位置
+      restoreQuickFavoritesUiStateFromLocalStorageIfNeeded();
       restoreQuickFavoritesPosFromLocalStorageIfNeeded();
       restoreQuickFavoritesEmbeddedIndexFromLocalStorageIfNeeded();
+      restoreNoRefreshUiStateFromLocalStorageIfNeeded();
     }
   }
 
   async function saveConfig() {
     const ST_API = getSTApi();
 
-    // 无论 variables.set 是否可用，都写一份 localStorage 兜底（主要解决“拖拽位置不记忆”）
+    // 无论 variables.set 是否可用，都写一份 localStorage 兜底（主要解决“快捷收藏栏 UI 状态 / 拖拽位置不记忆”）
+    persistQuickFavoritesUiStateToLocalStorage();
     persistQuickFavoritesPosToLocalStorage();
     persistQuickFavoritesEmbeddedIndexToLocalStorage();
+    persistNoRefreshUiStateToLocalStorage();
 
     if (!ST_API?.variables?.set) return;
 
@@ -1226,6 +1618,52 @@
     return String(s).replace(/["\\]/g, '\\$&');
   }
 
+  function refreshPromptManagerToolbarShortcutState() {
+    const bar = promptManagerToolbarEl || document.getElementById('pmg-prompt-manager-toolbar');
+    if (!(bar instanceof HTMLElement)) return;
+
+    const btnGrouping = bar.querySelector('#pmg_toolbar_toggle_grouping');
+    if (btnGrouping instanceof HTMLElement) {
+      const enabled = !!config.groupingEnabled;
+      btnGrouping.classList.toggle('pmg-toolbar-shortcut-active', enabled);
+      btnGrouping.title = enabled ? '分组已启用（点击禁用分组）' : '分组已禁用（点击启用分组）';
+      btnGrouping.setAttribute('aria-pressed', String(enabled));
+    }
+
+    const btnNativeDrag = bar.querySelector('#pmg_toolbar_toggle_native_drag');
+    if (btnNativeDrag instanceof HTMLElement) {
+      const disabled = !!config.disableNativeDragWhenGrouped;
+      btnNativeDrag.classList.toggle('pmg-toolbar-shortcut-active', disabled);
+      btnNativeDrag.innerHTML = disabled
+        ? '<span class="pmg-toolbar-icon-stack"><i class="fa-solid fa-arrows-up-down"></i><i class="fa-solid fa-slash pmg-toolbar-shortcut-slash"></i></span>'
+        : '<i class="fa-solid fa-arrows-up-down"></i>';
+      btnNativeDrag.title = disabled
+        ? '已禁用拖拽排序（点击允许拖拽）'
+        : '允许拖拽排序（点击禁用拖拽，防止误触）';
+      btnNativeDrag.setAttribute('aria-pressed', String(disabled));
+    }
+  }
+
+  async function handlePromptManagerToolbarShortcutToggle(key) {
+    if (key === 'grouping') {
+      config.groupingEnabled = !config.groupingEnabled;
+    } else if (key === 'nativeDrag') {
+      config.disableNativeDragWhenGrouped = !config.disableNativeDragWhenGrouped;
+    } else {
+      return;
+    }
+
+    // “预设条目开关时阻止预设面板刷新”已作为默认行为，不再暴露给用户关闭。
+    config.blockPresetUiRefreshOnToggle = true;
+    await installPromptManagerNativePatch();
+    applyNativeDragState(currentListEl);
+    refreshPromptManagerToolbarShortcutState();
+    await saveConfig();
+    if (!requestPromptManagerNativeRender(false)) {
+      debounceApply(`toolbar-${key}-toggle`, 0);
+    }
+  }
+
   function ensurePromptManagerToolbar(listEl) {
     const list = listEl || findPromptManagerList();
     const pm = getPromptManagerContainer();
@@ -1236,6 +1674,44 @@
       bar = document.createElement('div');
       bar.id = 'pmg-prompt-manager-toolbar';
       bar.className = 'pmg-pm-toolbar flex-container gap10px';
+
+      const btnNativeDrag = document.createElement('div');
+      btnNativeDrag.id = 'pmg_toolbar_toggle_native_drag';
+      btnNativeDrag.className = 'menu_button pmg-toolbar-shortcut-btn';
+      btnNativeDrag.innerHTML = '<i class="fa-solid fa-arrows-up-down"></i>';
+      btnNativeDrag.tabIndex = 0;
+      btnNativeDrag.setAttribute('role', 'button');
+      btnNativeDrag.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        void handlePromptManagerToolbarShortcutToggle('nativeDrag');
+      });
+      btnNativeDrag.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          e.stopPropagation();
+          void handlePromptManagerToolbarShortcutToggle('nativeDrag');
+        }
+      });
+
+      const btnGrouping = document.createElement('div');
+      btnGrouping.id = 'pmg_toolbar_toggle_grouping';
+      btnGrouping.className = 'menu_button pmg-toolbar-shortcut-btn';
+      btnGrouping.innerHTML = '<i class="fa-solid fa-layer-group"></i>';
+      btnGrouping.tabIndex = 0;
+      btnGrouping.setAttribute('role', 'button');
+      btnGrouping.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        void handlePromptManagerToolbarShortcutToggle('grouping');
+      });
+      btnGrouping.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          e.stopPropagation();
+          void handlePromptManagerToolbarShortcutToggle('grouping');
+        }
+      });
 
       const btnSettings = document.createElement('div');
       btnSettings.className = 'menu_button';
@@ -1255,12 +1731,15 @@
         void openPmgPrefixEditor();
       });
 
+      bar.appendChild(btnNativeDrag);
+      bar.appendChild(btnGrouping);
       bar.appendChild(btnSettings);
       bar.appendChild(btnPrefix);
       promptManagerToolbarEl = bar;
     } else {
       promptManagerToolbarEl = bar;
     }
+    refreshPromptManagerToolbarShortcutState();
 
     // 插入位置：footer 与 list 之间
     const footer = pm.querySelector('.completion_prompt_manager_footer');
@@ -1926,7 +2405,7 @@
       e.stopPropagation();
       toggleFavoriteItem(identifier);
       refreshVisual();
-      await saveConfig();
+      persistNoRefreshUiStateToLocalStorage();
       renderAllFavoritesPanels();
     };
 
@@ -2025,8 +2504,8 @@
         setCollapsedGroup2(key, !isGroup2Collapsed(key));
       }
       refreshVisual();
-      applyCollapseVisibility();
-      await saveConfig();
+      applyCurrentCollapseVisibility();
+      persistNoRefreshUiStateToLocalStorage();
       renderAllFavoritesPanels();
     };
 
@@ -2045,7 +2524,7 @@
         toggleFavoriteGroup2(key);
       }
       refreshVisual();
-      await saveConfig();
+      persistNoRefreshUiStateToLocalStorage();
       renderAllFavoritesPanels();
     };
 
@@ -2064,40 +2543,254 @@
   // Apply grouping + collapse
   // ---------------------------------------------------------------------------
 
+  function shouldDisableNativeDrag() {
+    return !!config.disableNativeDragWhenGrouped;
+  }
+
+  function getPromptItemSelector(listEl) {
+    const draggableClass = getNativeDraggableItemClass(listEl);
+    return `.${draggableClass}`;
+  }
+
+  function getNativeDraggableItemClass(listEl) {
+    const id = String(listEl?.id || 'completion_prompt_manager_list');
+    if (id.endsWith('prompt_manager_list')) {
+      return id.replace(/prompt_manager_list$/, 'prompt_manager_prompt_draggable');
+    }
+    return 'completion_prompt_manager_prompt_draggable';
+  }
+
+  function getNativePromptItemClass(listEl) {
+    const id = String(listEl?.id || 'completion_prompt_manager_list');
+    if (id.endsWith('prompt_manager_list')) {
+      return id.replace(/prompt_manager_list$/, 'prompt_manager_prompt');
+    }
+    return 'completion_prompt_manager_prompt';
+  }
+
+  function setNativeDraggableItemClass(listEl, enabled) {
+    if (!(listEl instanceof HTMLElement)) return;
+    const draggableClass = getNativeDraggableItemClass(listEl);
+    const promptClass = getNativePromptItemClass(listEl);
+    for (const li of Array.from(listEl.querySelectorAll(`li.${promptClass}`))) {
+      if (!(li instanceof HTMLElement)) continue;
+      li.classList.toggle(draggableClass, !!enabled);
+    }
+  }
+
+  function getSortableInstance($, listEl) {
+    try {
+      return $(listEl).data('ui-sortable') || $(listEl).data('sortable') || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function setSortableOptionsSafely($, listEl, options) {
+    try {
+      if (!getSortableInstance($, listEl)) return false;
+      for (const [key, value] of Object.entries(options || {})) {
+        try { $(listEl).sortable('option', key, value); } catch { /* ignore one option */ }
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function installSortableDragPerformanceGuard($, listEl) {
+    if (!(listEl instanceof HTMLElement)) return false;
+    try {
+      if (!getSortableInstance($, listEl)) return false;
+    } catch {
+      return false;
+    }
+
+    let originalStart = null;
+    let originalStop = null;
+    try { originalStart = $(listEl).sortable('option', 'start'); } catch { originalStart = null; }
+    try { originalStop = $(listEl).sortable('option', 'stop'); } catch { originalStop = null; }
+
+    // 避免反复包装 start/stop；若 sortable 被原生或其他插件重建，当前 option 会变回非 PMG 包装函数，届时会重新补挂。
+    if (originalStart?.__pmgSortableDragPerformanceGuard && originalStop?.__pmgSortableDragPerformanceGuard) return true;
+
+    originalStart = originalStart?.__pmgOriginalSortableCallback || originalStart;
+    originalStop = originalStop?.__pmgOriginalSortableCallback || originalStop;
+
+    const guardedStart = function pmgSortableDragPerformanceStart(event, ui) {
+      beginPromptListDrag('native-sortable-start', { sortableStarted: true });
+      if (typeof originalStart === 'function') {
+        return originalStart.call(this, event, ui);
+      }
+    };
+    guardedStart.__pmgSortableDragPerformanceGuard = true;
+    guardedStart.__pmgOriginalSortableCallback = originalStart;
+
+    const guardedStop = function pmgSortableDragPerformanceStop(event, ui) {
+      try {
+        if (typeof originalStop === 'function') {
+          return originalStop.call(this, event, ui);
+        }
+      } finally {
+        endPromptListDrag('native-sortable-stop');
+      }
+    };
+    guardedStop.__pmgSortableDragPerformanceGuard = true;
+    guardedStop.__pmgOriginalSortableCallback = originalStop;
+
+    listEl.__pmgSortableDragPerformanceGuardInstalled = true;
+    listEl.__pmgSortableOriginalStart = originalStart;
+    listEl.__pmgSortableOriginalStop = originalStop;
+
+    setSortableOptionsSafely($, listEl, {
+      start: guardedStart,
+      stop: guardedStop,
+    });
+
+    return true;
+  }
+
+  function installNativeDragEventGuard(listEl) {
+    if (!(listEl instanceof HTMLElement)) return;
+    if (listEl.__pmgNativeDragEventGuardInstalled) return;
+
+    const isPromptDragStartCandidate = (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return false;
+      if (target.closest('.pmg-group-header')) return false;
+      const promptClass = getNativePromptItemClass(listEl);
+      const li = target.closest(`li.${promptClass}`);
+      if (!li || !listEl.contains(li)) return false;
+
+      // 操作按钮区域继续允许正常点击；这些元素本身不是排序入口。
+      if (target.closest('.prompt_manager_prompt_controls')) return false;
+      if (target.closest('.prompt-manager-toggle-action')) return false;
+      if (target.closest('.prompt-manager-edit-action')) return false;
+      if (target.closest('.prompt-manager-detach-action')) return false;
+      if (target.closest('[data-pmg-role="item-fav"]')) return false;
+
+      return true;
+    };
+
+    const onPromptDragStartCandidate = (event) => {
+      if (!isPromptDragStartCandidate(event)) return;
+
+      if (!shouldDisableNativeDrag()) {
+        // sortable 真正 start 前会先产生 helper/placeholder 等早期 DOM 变化；提前进入保护态可消除拖拽起步卡顿。
+        // markPending=false：普通点击不会在松手后触发额外重分组，只有后续 mutation 或 sortable start 才会刷新。
+        beginPromptListDrag('prompt-pointer-down', { markPending: false });
+        return;
+      }
+
+      // jQuery UI sortable 在列表元素上监听 mousedown/touchstart。
+      // 捕获阶段阻断这些“拖拽起始事件”，可以避免 sortable 已初始化或后续被重启时仍然响应。
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+    };
+
+    listEl.addEventListener('pointerdown', onPromptDragStartCandidate, true);
+    listEl.addEventListener('mousedown', onPromptDragStartCandidate, true);
+    listEl.addEventListener('touchstart', onPromptDragStartCandidate, true);
+
+    if (!document.__pmgPromptDragEndGuardInstalled) {
+      document.addEventListener('pointerup', () => endPromptListDrag('prompt-pointer-up'), true);
+      document.addEventListener('pointercancel', () => endPromptListDrag('prompt-pointer-cancel'), true);
+      document.addEventListener('mouseup', () => endPromptListDrag('prompt-mouse-up'), true);
+      document.addEventListener('touchend', () => endPromptListDrag('prompt-touch-end'), true);
+      document.addEventListener('touchcancel', () => endPromptListDrag('prompt-touch-cancel'), true);
+      window.addEventListener('blur', () => endPromptListDrag('prompt-window-blur'), true);
+      document.__pmgPromptDragEndGuardInstalled = true;
+    }
+
+    listEl.__pmgNativeDragEventGuardInstalled = true;
+    listEl.__pmgNativeDragEventGuard = onPromptDragStartCandidate;
+  }
+
   function disableNativeSortable(listEl) {
+    if (!(listEl instanceof HTMLElement)) return;
+    installNativeDragEventGuard(listEl);
+
+    // 始终加 fallback class：即使 jQuery sortable 已存在，也用 CSS 禁用 handle 的 pointer events。
+    listEl.classList.add('pmg-no-native-drag');
+    setNativeDraggableItemClass(listEl, false);
+
+    listEl.dataset.pmgNativeDragDisabled = '1';
+    delete listEl.dataset.pmgNativeDragEnabled;
+
     const $ = getJQuery();
     if ($ && typeof $(listEl).sortable === 'function') {
       try {
-        const inst = $(listEl).data('ui-sortable');
-        if (inst) { $(listEl).sortable('disable'); return; }
+        if (getSortableInstance($, listEl)) {
+          // 多重保险：
+          // - disabled: true 阻止 sortable 捕获鼠标；
+          // - items 指向不存在的选择器，避免 refresh 后仍找到可排序项；
+          // - cancel: '*' 让所有子元素都不是可拖拽起点。
+          setSortableOptionsSafely($, listEl, {
+            disabled: true,
+            items: '.pmg-native-drag-disabled-never',
+            cancel: '*',
+          });
+          try { $(listEl).sortable('disable'); } catch { /* ignore */ }
+          try { $(listEl).sortable('refresh'); } catch { /* ignore */ }
+        }
       } catch { /* ignore */ }
     }
-    listEl.classList.add('pmg-no-native-drag');
   }
 
   function enableNativeSortable(listEl) {
+    if (!(listEl instanceof HTMLElement)) return;
+    listEl.classList.remove('pmg-no-native-drag');
+    setNativeDraggableItemClass(listEl, true);
+
+    delete listEl.dataset.pmgNativeDragDisabled;
+
     const $ = getJQuery();
     if ($ && typeof $(listEl).sortable === 'function') {
       try {
-        const inst = $(listEl).data('ui-sortable');
-        if (inst) { $(listEl).sortable('enable'); return; }
+        if (getSortableInstance($, listEl)) {
+          if (listEl.dataset.pmgNativeDragEnabled === '1') {
+            installSortableDragPerformanceGuard($, listEl);
+            return;
+          }
+
+          setSortableOptionsSafely($, listEl, {
+            disabled: false,
+            items: getPromptItemSelector(listEl),
+            cancel: 'input, textarea, button, select, option, a, .prompt_manager_prompt_controls, .prompt-manager-toggle-action, .prompt-manager-edit-action, .prompt-manager-detach-action, [data-pmg-role="item-fav"]',
+          });
+          installSortableDragPerformanceGuard($, listEl);
+          try { $(listEl).sortable('enable'); } catch { /* ignore */ }
+          try { $(listEl).sortable('refresh'); } catch { /* ignore */ }
+          listEl.dataset.pmgNativeDragEnabled = '1';
+        }
       } catch { /* ignore */ }
     }
-    listEl.classList.remove('pmg-no-native-drag');
+  }
+
+  function applyNativeDragState(listEl = currentListEl) {
+    if (!(listEl instanceof HTMLElement)) return;
+    installNativeDragEventGuard(listEl);
+    if (shouldDisableNativeDrag()) {
+      disableNativeSortable(listEl);
+    } else {
+      enableNativeSortable(listEl);
+    }
+  }
+
+  function applyCurrentCollapseVisibility() {
+    applyCollapseVisibility();
   }
 
   function applyGrouping() {
     if (!currentListEl) return;
     const listEl = currentListEl;
 
+    suppressOwnListMutations(220);
+
     removeInjectedGroupHeaders(listEl);
     cleanupPromptItemMarks(listEl);
 
-    if (config.groupingEnabled) {
-      disableNativeSortable(listEl);
-    } else {
-      enableNativeSortable(listEl);
-    }
+    applyNativeDragState(listEl);
 
     const items = Array.from(listEl.children).filter(isPromptItemLi);
 
@@ -2109,6 +2802,7 @@
 
     if (!config.groupingEnabled) {
       for (const li of items) restorePromptDisplayName(li);
+      suppressOwnListMutations(120);
       applyCollapseVisibility();
       return;
     }
@@ -2119,6 +2813,7 @@
     const group1OccCount = {};
     const group2OccCount = {};
     let currentGroupId = null;
+    const fragment = document.createDocumentFragment();
 
     const prefixRules = buildPrefixParseRules();
 
@@ -2137,6 +2832,7 @@
         li.dataset.pmgHasPrefix = '0';
         li.classList.add('pmg-item-standalone');
         restorePromptDisplayName(li);
+        fragment.appendChild(li);
         continue;
       }
 
@@ -2154,7 +2850,7 @@
         currentGroupId = buildGroup1Id(g1, occ);
         const header1Title = occ > 0 ? `${g1} (${occ + 1})` : g1;
         const header1 = createGroupHeaderLi({ level: 1, group1: g1, groupId: currentGroupId, displayTitle: header1Title });
-        listEl.insertBefore(header1, li);
+        fragment.appendChild(header1);
         currentGroup1 = g1;
         currentGroup2 = null;
       }
@@ -2180,7 +2876,7 @@
         if (g2 !== currentGroup2) {
           const header2Title = effectiveG2Occ > 0 ? `${g2} (${effectiveG2Occ + 1})` : g2;
           const header2 = createGroupHeaderLi({ level: 2, group1: g1, group2: g2, groupId: currentGroupId, group2Id, displayTitle: header2Title });
-          listEl.insertBefore(header2, li);
+          fragment.appendChild(header2);
           currentGroup2 = g2;
         }
       } else {
@@ -2195,8 +2891,11 @@
       } else {
         restorePromptDisplayName(li);
       }
+
+      fragment.appendChild(li);
     }
 
+    listEl.appendChild(fragment);
     applyCollapseVisibility();
   }
 
@@ -2616,7 +3315,7 @@
       cFav.addEventListener('click', async (e) => {
         e.preventDefault(); e.stopPropagation();
         toggleFavoriteItem(it.identifier);
-        await saveConfig();
+        persistNoRefreshUiStateToLocalStorage();
         renderAllFavoritesPanels();
         debounceApply(debugTag || 'toggle-fav-item', 0);
       });
@@ -2646,7 +3345,7 @@
         if (e?.preventDefault) e.preventDefault();
         if (e?.stopPropagation) e.stopPropagation();
         setFavoritesGroup1Expanded(g1Id, !isFavoritesGroup1Expanded(g1Id));
-        await saveConfig();
+        persistNoRefreshUiStateToLocalStorage();
         renderAllFavoritesPanels();
       };
 
@@ -2669,7 +3368,7 @@
       btnUnfav.addEventListener('click', async (e) => {
         e.preventDefault(); e.stopPropagation();
         toggleFavoriteGroup1(g1Id);
-        await saveConfig();
+        persistNoRefreshUiStateToLocalStorage();
         renderAllFavoritesPanels();
         debounceApply('unfav-group1', 0);
       });
@@ -2721,7 +3420,7 @@
             if (ev?.preventDefault) ev.preventDefault();
             if (ev?.stopPropagation) ev.stopPropagation();
             setFavoritesGroup2Expanded(g2Id, !isFavoritesGroup2Expanded(g2Id));
-            await saveConfig();
+            persistNoRefreshUiStateToLocalStorage();
             renderAllFavoritesPanels();
           };
           g2Exp.addEventListener('click', toggleG2Expand);
@@ -2741,7 +3440,7 @@
           g2Fav.addEventListener('click', async (ev) => {
             ev.preventDefault(); ev.stopPropagation();
             toggleFavoriteGroup2(g2Id);
-            await saveConfig();
+            persistNoRefreshUiStateToLocalStorage();
             renderAllFavoritesPanels();
             debounceApply('unfav-sub-group2', 0);
           });
@@ -2778,7 +3477,7 @@
         if (e?.preventDefault) e.preventDefault();
         if (e?.stopPropagation) e.stopPropagation();
         setFavoritesGroup2Expanded(g2Id, !isFavoritesGroup2Expanded(g2Id));
-        await saveConfig();
+        persistNoRefreshUiStateToLocalStorage();
         renderAllFavoritesPanels();
       };
 
@@ -2801,7 +3500,7 @@
       btnUnfav.addEventListener('click', async (e) => {
         e.preventDefault(); e.stopPropagation();
         toggleFavoriteGroup2(g2Id);
-        await saveConfig();
+        persistNoRefreshUiStateToLocalStorage();
         renderAllFavoritesPanels();
         debounceApply('unfav-group2', 0);
       });
@@ -2851,7 +3550,7 @@
       btnUnfav.addEventListener('click', async (e) => {
         e.preventDefault(); e.stopPropagation();
         toggleFavoriteItem(id);
-        await saveConfig();
+        persistNoRefreshUiStateToLocalStorage();
         renderAllFavoritesPanels();
         debounceApply('unfav-item', 0);
       });
@@ -2913,7 +3612,7 @@
         icon?.classList.remove('fa-circle-chevron-up', 'up');
         icon?.classList.add('fa-circle-chevron-down', 'down');
       }
-      await saveConfig();
+      persistNoRefreshUiStateToLocalStorage();
     };
 
     header.addEventListener('click', toggleDrawer);
@@ -3123,7 +3822,7 @@
       const rel = toRelativeFloatingPos(el, { left: rect.left, top: rect.top });
       pos.relX = rel.relX;
       pos.relY = rel.relY;
-      void saveConfig();
+      persistQuickFavoritesPosToLocalStorage();
     } catch {
       // ignore
     }
@@ -3161,6 +3860,98 @@
   const LS_KEY_FLOATING_TOGGLE_POS = '__pmg_floating_toggle_pos_v1';
   const LS_KEY_FLOATING_PANEL_POS = '__pmg_floating_panel_pos_v1';
   const LS_KEY_EMBEDDED_INDEX = '__pmg_quick_favorites_embedded_index_v1';
+  const LS_KEY_FLOATING_UI_STATE = '__pmg_quick_favorites_ui_state_v1';
+  // UI-only / shortcut states. Persisting these through ST_API.variables.set can
+  // trigger SillyTavern settings update hooks and refresh Prompt Manager.
+  const LS_KEY_NO_REFRESH_UI_STATE = '__pmg_no_refresh_ui_state_v1';
+
+  function getNoRefreshUiStateSnapshot() {
+    return {
+      collapsed: config?.collapsed ?? { group1: [], group2: [] },
+      collapsedByPreset: config?.collapsedByPreset ?? {},
+      favorites: config?.favorites ?? { group1: [], group2: [], items: [] },
+      favoritesByPreset: config?.favoritesByPreset ?? {},
+      favoritesExpanded: config?.favoritesExpanded ?? { group1: [], group2: [] },
+      favoritesExpandedByPreset: config?.favoritesExpandedByPreset ?? {},
+      favoritesPanelExpanded: !!config?.favoritesPanelExpanded,
+      nativePanelCollapsed: config?.nativePanelCollapsed ?? {},
+      nativePresetFavorites: Array.isArray(config?.nativePresetFavorites) ? config.nativePresetFavorites : [],
+    };
+  }
+
+  function persistNoRefreshUiStateToLocalStorage() {
+    safeWriteLocalStorageJson(LS_KEY_NO_REFRESH_UI_STATE, getNoRefreshUiStateSnapshot());
+  }
+
+  function restoreNoRefreshUiStateFromLocalStorageIfNeeded() {
+    try {
+      if (!config || typeof config !== 'object') return;
+      const v = safeReadLocalStorageJson(LS_KEY_NO_REFRESH_UI_STATE);
+      if (!v || typeof v !== 'object' || Array.isArray(v)) return;
+
+      if (v.collapsed && typeof v.collapsed === 'object' && !Array.isArray(v.collapsed)) {
+        config.collapsed = ensureCollapsedShape(v.collapsed);
+        config.collapsed.group1 = ensureArrayUnique(config.collapsed.group1);
+        config.collapsed.group2 = ensureArrayUnique(config.collapsed.group2);
+      }
+      if (v.collapsedByPreset && typeof v.collapsedByPreset === 'object' && !Array.isArray(v.collapsedByPreset)) {
+        config.collapsedByPreset = {};
+        for (const [pn, st] of Object.entries(v.collapsedByPreset)) {
+          const shaped = ensureCollapsedShape(st);
+          shaped.group1 = ensureArrayUnique(shaped.group1);
+          shaped.group2 = ensureArrayUnique(shaped.group2);
+          config.collapsedByPreset[pn] = shaped;
+        }
+      }
+
+      if (v.favorites && typeof v.favorites === 'object' && !Array.isArray(v.favorites)) {
+        config.favorites = ensureFavoritesStoreShape(v.favorites);
+        config.favorites.group1 = ensureArrayUnique(config.favorites.group1);
+        config.favorites.group2 = ensureArrayUnique(config.favorites.group2);
+        config.favorites.items = ensureArrayUnique(config.favorites.items);
+      }
+      if (v.favoritesByPreset && typeof v.favoritesByPreset === 'object' && !Array.isArray(v.favoritesByPreset)) {
+        config.favoritesByPreset = {};
+        for (const [pn, st] of Object.entries(v.favoritesByPreset)) {
+          const shaped = ensureFavoritesStoreShape(st);
+          shaped.group1 = ensureArrayUnique(shaped.group1);
+          shaped.group2 = ensureArrayUnique(shaped.group2);
+          shaped.items = ensureArrayUnique(shaped.items);
+          config.favoritesByPreset[pn] = shaped;
+        }
+      }
+
+      if (v.favoritesExpanded && typeof v.favoritesExpanded === 'object' && !Array.isArray(v.favoritesExpanded)) {
+        config.favoritesExpanded = ensureFavoritesExpandedShape(v.favoritesExpanded);
+        config.favoritesExpanded.group1 = ensureArrayUnique(config.favoritesExpanded.group1);
+        config.favoritesExpanded.group2 = ensureArrayUnique(config.favoritesExpanded.group2);
+      }
+      if (v.favoritesExpandedByPreset && typeof v.favoritesExpandedByPreset === 'object' && !Array.isArray(v.favoritesExpandedByPreset)) {
+        config.favoritesExpandedByPreset = {};
+        for (const [pn, st] of Object.entries(v.favoritesExpandedByPreset)) {
+          const shaped = ensureFavoritesExpandedShape(st);
+          shaped.group1 = ensureArrayUnique(shaped.group1);
+          shaped.group2 = ensureArrayUnique(shaped.group2);
+          config.favoritesExpandedByPreset[pn] = shaped;
+        }
+      }
+
+      if (typeof v.favoritesPanelExpanded === 'boolean') {
+        config.favoritesPanelExpanded = v.favoritesPanelExpanded;
+      }
+      if (v.nativePanelCollapsed && typeof v.nativePanelCollapsed === 'object' && !Array.isArray(v.nativePanelCollapsed)) {
+        config.nativePanelCollapsed = {};
+        for (const [k, val] of Object.entries(v.nativePanelCollapsed)) {
+          config.nativePanelCollapsed[String(k)] = !!val;
+        }
+      }
+      if (Array.isArray(v.nativePresetFavorites)) {
+        config.nativePresetFavorites = ensureArrayUnique(v.nativePresetFavorites).map(String).filter(Boolean);
+      }
+    } catch {
+      // ignore
+    }
+  }
 
   function safeReadLocalStorageJson(key) {
     try {
@@ -3196,6 +3987,30 @@
       if (tp && typeof tp === 'object') config.floatingTogglePos = tp;
       const pp = safeReadLocalStorageJson(LS_KEY_FLOATING_PANEL_POS);
       if (pp && typeof pp === 'object') config.floatingPanelPos = pp;
+    } catch {
+      // ignore
+    }
+  }
+
+  function persistQuickFavoritesUiStateToLocalStorage() {
+    safeWriteLocalStorageJson(LS_KEY_FLOATING_UI_STATE, {
+      floatingPanelExpanded: !!config?.floatingPanelExpanded,
+      floatingPanelActiveTab: getFloatingPanelActiveTab(),
+    });
+  }
+
+  function restoreQuickFavoritesUiStateFromLocalStorageIfNeeded() {
+    try {
+      if (!config || typeof config !== 'object') return;
+      const v = safeReadLocalStorageJson(LS_KEY_FLOATING_UI_STATE);
+      if (!v || typeof v !== 'object' || Array.isArray(v)) return;
+
+      if (typeof v.floatingPanelExpanded === 'boolean') {
+        config.floatingPanelExpanded = v.floatingPanelExpanded;
+      }
+      if (v.floatingPanelActiveTab === 'favorites' || v.floatingPanelActiveTab === 'presets') {
+        config.floatingPanelActiveTab = v.floatingPanelActiveTab;
+      }
     } catch {
       // ignore
     }
@@ -3243,6 +4058,10 @@
         ? config.quickFavoritesEmbeddedIndexByPlacement
         : { qr: null, send: null };
     config.quickFavoritesEmbeddedIndexByPlacement[placement] = Number.isInteger(index) && index >= 0 ? index : null;
+
+    // 位置属于用户刚完成的拖拽结果，必须同步写入 localStorage 兜底。
+    // 如果只依赖后续的 variables.set / 防抖保存，用户拖完立刻刷新时会偶发丢失。
+    persistQuickFavoritesEmbeddedIndexToLocalStorage();
   }
 
   function placeElementAtIndex(parent, el, index) {
@@ -3272,8 +4091,29 @@
     if (quickFavEmbeddedSaveTimer) clearTimeout(quickFavEmbeddedSaveTimer);
     quickFavEmbeddedSaveTimer = setTimeout(() => {
       quickFavEmbeddedSaveTimer = null;
-      void saveConfig();
+      persistQuickFavoritesEmbeddedIndexToLocalStorage();
     }, 250);
+  }
+
+  function flushQuickFavEmbeddedIndexSave() {
+    if (quickFavEmbeddedSaveTimer) {
+      clearTimeout(quickFavEmbeddedSaveTimer);
+      quickFavEmbeddedSaveTimer = null;
+    }
+
+    persistQuickFavoritesEmbeddedIndexToLocalStorage();
+  }
+
+  let quickFavEmbeddedBeforeUnloadGuardInstalled = false;
+  function ensureQuickFavEmbeddedBeforeUnloadGuard() {
+    if (quickFavEmbeddedBeforeUnloadGuardInstalled) return;
+    quickFavEmbeddedBeforeUnloadGuardInstalled = true;
+
+    window.addEventListener('pagehide', flushQuickFavEmbeddedIndexSave, true);
+    window.addEventListener('beforeunload', flushQuickFavEmbeddedIndexSave, true);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') flushQuickFavEmbeddedIndexSave();
+    }, true);
   }
 
   function recordQuickFavEmbeddedIndexNow(target, placement) {
@@ -3297,6 +4137,7 @@
     teardownQuickFavEmbeddedObserver();
     quickFavEmbeddedObserverTarget = target;
     quickFavEmbeddedObserverPlacement = placement;
+    ensureQuickFavEmbeddedBeforeUnloadGuard();
     quickFavEmbeddedObserver = new MutationObserver(() => {
       if (quickFavEmbeddedObserverApplying) return;
       recordQuickFavEmbeddedIndexNow(target, placement);
@@ -3381,10 +4222,34 @@
     const header = document.createElement('div');
     header.className = 'pmg-floating-header';
 
-    const titleSpan = document.createElement('span');
-    titleSpan.className = 'pmg-floating-title';
-    titleSpan.textContent = '\u2B50 收藏快捷栏';
-    header.appendChild(titleSpan);
+    const tabs = document.createElement('div');
+    tabs.className = 'pmg-floating-tabs';
+
+    const makeTab = (tab, text, iconClass) => {
+      const btn = document.createElement('span');
+      btn.className = 'pmg-floating-tab interactable';
+      btn.dataset.pmgFloatingTab = tab;
+      btn.tabIndex = 0;
+      btn.setAttribute('role', 'button');
+      btn.innerHTML = `<i class="${iconClass}"></i><span>${text}</span>`;
+      const activate = async (e) => {
+        if (e?.preventDefault) e.preventDefault();
+        if (e?.stopPropagation) e.stopPropagation();
+        setFloatingPanelActiveTab(tab);
+        refreshFloatingPanelTabs();
+        renderFloatingFavoritesPanel();
+        persistQuickFavoritesUiStateToLocalStorage();
+      };
+      btn.addEventListener('click', activate);
+      btn.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') void activate(e);
+      });
+      return btn;
+    };
+
+    tabs.appendChild(makeTab('favorites', '快捷收藏栏', 'fa-solid fa-star'));
+    tabs.appendChild(makeTab('presets', '收藏预设', 'fa-solid fa-layer-group'));
+    header.appendChild(tabs);
 
     const settingsBtn = document.createElement('span');
     settingsBtn.className = 'pmg-floating-settings fa-solid fa-gear interactable';
@@ -3437,7 +4302,7 @@
       onDragEnd: async (pos) => {
         if (getQuickFavoritesButtonPlacement() !== 'floating') return;
         config.floatingTogglePos = { ...pos, ...toRelativeFloatingPos(toggleBtn, pos) };
-        await saveConfig();
+        persistQuickFavoritesPosToLocalStorage();
       },
     });
 
@@ -3449,7 +4314,7 @@
         try { await refreshActivePresetName(false); } catch { /* ignore */ }
         renderFloatingFavoritesPanel();
       }
-      await saveConfig();
+      persistQuickFavoritesUiStateToLocalStorage();
     };
 
     // 点击星形按钮：仅在非拖拽时 toggle
@@ -3470,13 +4335,17 @@
     installDrag(panel, header, {
       threshold: 5,
       shouldIgnore: (e) => {
-        // 不拦截关闭按钮的点击
+        // 不拦截关闭/设置/页签按钮的点击
         const t = e.target;
-        return t instanceof HTMLElement && (!!t.closest('.pmg-floating-close') || !!t.closest('.pmg-floating-settings'));
+        return t instanceof HTMLElement && (
+          !!t.closest('.pmg-floating-close') ||
+          !!t.closest('.pmg-floating-settings') ||
+          !!t.closest('.pmg-floating-tab')
+        );
       },
       onDragEnd: async (pos) => {
         config.floatingPanelPos = { ...pos, ...toRelativeFloatingPos(panel, pos) };
-        await saveConfig();
+        persistQuickFavoritesPosToLocalStorage();
       },
     });
 
@@ -3517,16 +4386,45 @@
   function renderFloatingFavoritesPanel() {
     if (!floatingPanelEl || !config.floatingPanelExpanded) return;
 
-    // 标题显示当前预设名（按预设隔离收藏，避免混淆）
-    const title = floatingPanelEl.querySelector('.pmg-floating-title');
-    if (title) {
-      const pn = activePresetName ? `（${activePresetName}）` : '';
-      title.textContent = `\u2B50 收藏快捷栏${pn}`;
-    }
+    refreshFloatingPanelTabs();
 
     const body = floatingPanelEl.querySelector('.pmg-floating-body');
     if (!body) return;
+
+    const tab = getFloatingPanelActiveTab();
+    if (tab === 'presets') {
+      body.innerHTML = '';
+      renderNativePresetFavoritesQuickSection(body, { showEmpty: true });
+      return;
+    }
+
     renderFavoritesContent(body);
+  }
+
+  function getFloatingPanelActiveTab() {
+    const v = String(config?.floatingPanelActiveTab || 'favorites');
+    return v === 'presets' ? 'presets' : 'favorites';
+  }
+
+  function setFloatingPanelActiveTab(tab) {
+    config.floatingPanelActiveTab = tab === 'presets' ? 'presets' : 'favorites';
+  }
+
+  function refreshFloatingPanelTabs() {
+    if (!floatingPanelEl) return;
+    const active = getFloatingPanelActiveTab();
+    for (const btn of Array.from(floatingPanelEl.querySelectorAll('.pmg-floating-tab'))) {
+      if (!(btn instanceof HTMLElement)) continue;
+      const on = btn.dataset.pmgFloatingTab === active;
+      btn.classList.toggle('pmg-floating-tab-active', on);
+      btn.setAttribute('aria-pressed', String(on));
+      if (btn.dataset.pmgFloatingTab === 'favorites') {
+        const pn = activePresetName ? `当前预设：${activePresetName}` : '收藏的提示词条目/分组';
+        btn.title = pn;
+      } else {
+        btn.title = '已收藏的原生 OpenAI 预设';
+      }
+    }
   }
 
   function updateFloatingPanelVisibility() {
@@ -3550,6 +4448,1352 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Native OpenAI panel roll collapse
+  //
+  // 折叠 SillyTavern 原生预设界面（聊天补全设置面板）内若干常用区域。
+  // 实现方式：不移动原生 DOM 节点，只在第一个目标区域前插入一个总折叠头，并统一控制多个原生 root 的可见性。
+  // ---------------------------------------------------------------------------
+
+  /** @typedef {{ id: string, title: string, anchor: () => HTMLElement|null, resolveRoot: (anchorEl: HTMLElement) => HTMLElement|null }} NativeCollapseRegion */
+
+  const NATIVE_ROLL_REGION_ID = 'nativePresetRoll';
+
+  /** @type {NativeCollapseRegion[]} */
+  const NATIVE_PANEL_REGIONS = [
+    {
+      id: 'chatBehavior',
+      title: '聊天行为与功能',
+      anchor: () => document.getElementById('character_names_display'),
+      resolveRoot: (anchorEl) => {
+        // 锚点位于 Character Names Behavior inline-drawer 内；其外层 <div class=""> 是整块的容器。
+        const drawer = anchorEl?.closest('.inline-drawer');
+        if (!(drawer instanceof HTMLElement)) return null;
+        const parent = drawer.parentElement;
+        if (!(parent instanceof HTMLElement)) return null;
+        return parent;
+      },
+    },
+    {
+      id: 'quickPrompts',
+      title: '快速提示词编辑',
+      anchor: () => document.getElementById('main_prompt_quick_edit_textarea'),
+      resolveRoot: (anchorEl) => {
+        const drawer = anchorEl?.closest('.inline-drawer');
+        return drawer instanceof HTMLElement ? drawer : null;
+      },
+    },
+    {
+      id: 'utilityPrompts',
+      title: '实用提示词',
+      anchor: () => document.getElementById('impersonation_prompt_textarea'),
+      resolveRoot: (anchorEl) => {
+        const drawer = anchorEl?.closest('.inline-drawer');
+        return drawer instanceof HTMLElement ? drawer : null;
+      },
+    },
+    {
+      id: 'seed',
+      title: 'Seed（随机种子）',
+      anchor: () => document.getElementById('seed_openai'),
+      resolveRoot: (anchorEl) => {
+        const block = anchorEl?.closest('.range-block');
+        return block instanceof HTMLElement ? block : null;
+      },
+    },
+    {
+      id: 'logitBias',
+      title: 'Logit Bias（词符偏置）',
+      anchor: () => document.getElementById('logit_bias_openai'),
+      resolveRoot: (anchorEl) => {
+        // logit_bias_openai 本身是 range-block 的内部 title div，需要往上找到 range-block 容器
+        const block = anchorEl?.closest('.range-block');
+        return block instanceof HTMLElement ? block : null;
+      },
+    },
+  ];
+
+  const NATIVE_COLLAPSE_HEADER_CLASS = 'pmg-native-collapse-header';
+  const NATIVE_COLLAPSE_ROOT_ATTR = 'data-pmg-native-collapse-root';
+  const NATIVE_COLLAPSE_HEADER_ATTR = 'data-pmg-native-collapse-header';
+  const NATIVE_COLLAPSE_ANIMATION_MS = 140;
+
+  let nativePanelCollapseScanTimer = null;
+  let nativePanelCollapseRetryTimer = null;
+  let nativePanelCollapseRetryUntil = 0;
+
+  function ensureNativePanelCollapsedShape() {
+    if (!config.nativePanelCollapsed || typeof config.nativePanelCollapsed !== 'object' || Array.isArray(config.nativePanelCollapsed)) {
+      config.nativePanelCollapsed = {};
+    }
+  }
+
+  function isNativeRollCollapsed() {
+    ensureNativePanelCollapsedShape();
+    return !!config.nativePanelCollapsed[NATIVE_ROLL_REGION_ID];
+  }
+
+  function setNativeRollCollapsed(collapsed) {
+    ensureNativePanelCollapsedShape();
+    config.nativePanelCollapsed[NATIVE_ROLL_REGION_ID] = !!collapsed;
+  }
+
+  function collectNativeCollapseRoots() {
+    const roots = [];
+
+    for (const region of NATIVE_PANEL_REGIONS) {
+      const anchorEl = typeof region.anchor === 'function' ? region.anchor() : null;
+      if (!(anchorEl instanceof HTMLElement)) continue;
+      const rootEl = region.resolveRoot ? region.resolveRoot(anchorEl) : null;
+      if (!(rootEl instanceof HTMLElement)) continue;
+      if (!document.body.contains(rootEl)) continue;
+      if (roots.includes(rootEl)) continue;
+      roots.push(rootEl);
+    }
+
+    // 如果某个 root 已经包含另一个 root，只保留外层，避免重复动画/重复 display 控制。
+    const deduped = roots.filter((root) => !roots.some((other) => other !== root && other.contains(root)));
+
+    // 按 DOM 顺序排序，确保总折叠头插入在最靠前的目标区域前。
+    deduped.sort((a, b) => {
+      if (a === b) return 0;
+      const pos = a.compareDocumentPosition(b);
+      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      return 0;
+    });
+
+    return deduped;
+  }
+
+  function getNativeRootOriginalDisplay(rootEl) {
+    if (!(rootEl instanceof HTMLElement)) return '';
+    return typeof rootEl.dataset.pmgOriginalDisplay === 'string' ? rootEl.dataset.pmgOriginalDisplay : '';
+  }
+
+  function restoreNativeRootDisplay(rootEl) {
+    if (!(rootEl instanceof HTMLElement)) return;
+    if (rootEl.__pmgNativeCollapseAnimation) {
+      try { rootEl.__pmgNativeCollapseAnimation.cancel(); } catch { /* ignore */ }
+      rootEl.__pmgNativeCollapseAnimation = null;
+    }
+    // 只有 PMG 曾经记录过 display 时才恢复；否则不要动原生 display。
+    // 这样可以避免把 SillyTavern 根据 data-source / 当前模型源隐藏的块误显示出来。
+    if (!('pmgOriginalDisplay' in rootEl.dataset)) return;
+    const orig = rootEl.dataset.pmgOriginalDisplay || '';
+    if (orig) rootEl.style.display = orig;
+    else rootEl.style.removeProperty('display');
+  }
+
+  function hideNativeRootImmediately(rootEl) {
+    if (!(rootEl instanceof HTMLElement)) return;
+    if (!('pmgOriginalDisplay' in rootEl.dataset)) {
+      rootEl.dataset.pmgOriginalDisplay = rootEl.style.display || '';
+    }
+    rootEl.style.setProperty('display', 'none', 'important');
+    rootEl.style.removeProperty('max-height');
+    rootEl.style.removeProperty('overflow');
+    rootEl.style.removeProperty('opacity');
+    rootEl.style.removeProperty('transition');
+    rootEl.style.removeProperty('transform');
+    rootEl.style.removeProperty('transform-origin');
+    rootEl.style.removeProperty('will-change');
+    rootEl.style.removeProperty('clip-path');
+    if (rootEl.__pmgNativeCollapseAnimation) {
+      rootEl.__pmgNativeCollapseAnimation = null;
+    }
+  }
+
+  function showNativeRootImmediately(rootEl) {
+    if (!(rootEl instanceof HTMLElement)) return;
+    restoreNativeRootDisplay(rootEl);
+    rootEl.style.removeProperty('max-height');
+    rootEl.style.removeProperty('overflow');
+    rootEl.style.removeProperty('opacity');
+    rootEl.style.removeProperty('transition');
+    rootEl.style.removeProperty('transform');
+    rootEl.style.removeProperty('transform-origin');
+    rootEl.style.removeProperty('will-change');
+    rootEl.style.removeProperty('clip-path');
+    if (rootEl.__pmgNativeCollapseAnimation) {
+      rootEl.__pmgNativeCollapseAnimation = null;
+    }
+  }
+
+  function animateNativeRootVisibility(rootEl, collapsed) {
+    if (!(rootEl instanceof HTMLElement)) return;
+
+    if (rootEl.__pmgNativeCollapseAnimation) {
+      try { rootEl.__pmgNativeCollapseAnimation.cancel(); } catch { /* ignore */ }
+      rootEl.__pmgNativeCollapseAnimation = null;
+    }
+
+    // 重要：不要用 scaleY 来“收起”。transform 不改变布局占位，会导致内容视觉消失但页面留下一大片空白。
+    // 收起时直接 display:none，保证不占位；展开时再做一个不影响布局的轻量淡入动画。
+    if (collapsed) {
+      hideNativeRootImmediately(rootEl);
+      return;
+    }
+
+    const prefersReducedMotion = (() => {
+      try { return window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches; } catch { return false; }
+    })();
+
+    // 展开时做轻量 opacity/translateY 动画：不测量 scrollHeight，也不会留下折叠空白。
+    if (!rootEl.animate || prefersReducedMotion) {
+      showNativeRootImmediately(rootEl);
+      return;
+    }
+
+    const token = String(Date.now()) + Math.random().toString(36).slice(2);
+    rootEl.dataset.pmgNativeCollapseAnimationToken = token;
+
+    const timing = {
+      duration: NATIVE_COLLAPSE_ANIMATION_MS,
+      easing: 'cubic-bezier(0.22, 0.61, 0.36, 1)',
+      fill: 'both',
+    };
+
+    restoreNativeRootDisplay(rootEl);
+    rootEl.style.removeProperty('max-height');
+    rootEl.style.removeProperty('clip-path');
+    rootEl.style.removeProperty('transition');
+    rootEl.style.removeProperty('transform-origin');
+    rootEl.style.willChange = 'transform, opacity';
+
+    // 如果原生逻辑仍然要求隐藏（例如 data-source 不匹配），不要强行动画显示。
+    if (getComputedStyle(rootEl).display === 'none') {
+      delete rootEl.dataset.pmgNativeCollapseAnimationToken;
+      return;
+    }
+
+    const anim = rootEl.animate([
+      { transform: 'translateY(-4px)', opacity: 0 },
+      { transform: 'translateY(0)', opacity: 1 },
+    ], timing);
+    rootEl.__pmgNativeCollapseAnimation = anim;
+    anim.onfinish = () => {
+      if (rootEl.dataset.pmgNativeCollapseAnimationToken !== token) return;
+      rootEl.style.removeProperty('transform');
+      rootEl.style.removeProperty('opacity');
+      rootEl.style.removeProperty('will-change');
+      rootEl.style.removeProperty('overflow');
+      rootEl.__pmgNativeCollapseAnimation = null;
+      delete rootEl.dataset.pmgNativeCollapseAnimationToken;
+    };
+    anim.oncancel = () => {
+      if (rootEl.dataset.pmgNativeCollapseAnimationToken === token) delete rootEl.dataset.pmgNativeCollapseAnimationToken;
+      rootEl.style.removeProperty('will-change');
+      rootEl.__pmgNativeCollapseAnimation = null;
+    };
+  }
+
+  function applyNativeRollVisualState(headerEl, rootEls, collapsed, options = {}) {
+    if (!(headerEl instanceof HTMLElement)) return;
+    const roots = Array.isArray(rootEls) ? rootEls.filter((x) => x instanceof HTMLElement) : [];
+    const arrow = headerEl.querySelector('.pmg-native-collapse-icon');
+    if (arrow) {
+      arrow.classList.toggle('fa-chevron-right', collapsed);
+      arrow.classList.toggle('fa-chevron-down', !collapsed);
+    }
+    headerEl.classList.toggle('pmg-native-collapsed', !!collapsed);
+    headerEl.setAttribute('aria-expanded', String(!collapsed));
+
+    const animated = !!options.animated;
+    for (const rootEl of roots) {
+      rootEl.setAttribute(NATIVE_COLLAPSE_ROOT_ATTR, NATIVE_ROLL_REGION_ID);
+      if (animated) animateNativeRootVisibility(rootEl, collapsed);
+      else if (collapsed) hideNativeRootImmediately(rootEl);
+      else showNativeRootImmediately(rootEl);
+    }
+  }
+
+  function createNativeCollapseHeader(rootEls) {
+    const header = document.createElement('div');
+    header.className = NATIVE_COLLAPSE_HEADER_CLASS;
+    header.setAttribute(NATIVE_COLLAPSE_HEADER_ATTR, NATIVE_ROLL_REGION_ID);
+    header.tabIndex = 0;
+    header.setAttribute('role', 'button');
+    header.setAttribute('aria-expanded', String(!isNativeRollCollapsed()));
+
+    const arrow = document.createElement('span');
+    arrow.className = 'pmg-native-collapse-icon fa-solid fa-chevron-down';
+
+    const title = document.createElement('span');
+    title.className = 'pmg-native-collapse-title';
+    title.textContent = '其它设置';
+
+    const hint = document.createElement('small');
+    hint.className = 'pmg-native-collapse-hint';
+    hint.textContent = '思维链 / 发送文件 / Seed ...';
+
+    header.appendChild(arrow);
+    header.appendChild(title);
+    header.appendChild(hint);
+
+    const onToggle = async (e) => {
+      if (e && typeof e.preventDefault === 'function') e.preventDefault();
+      if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+      const roots = collectNativeCollapseRoots();
+      const next = !isNativeRollCollapsed();
+      setNativeRollCollapsed(next);
+      applyNativeRollVisualState(header, roots.length ? roots : rootEls, next, { animated: true });
+      persistNoRefreshUiStateToLocalStorage();
+    };
+
+    header.addEventListener('click', onToggle);
+    header.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') onToggle(e);
+    });
+
+    return header;
+  }
+
+  function removeStaleNativeCollapseHeadersExceptRoll() {
+    const headers = document.querySelectorAll(`.${NATIVE_COLLAPSE_HEADER_CLASS}`);
+    for (const h of Array.from(headers)) {
+      if (!(h instanceof HTMLElement)) continue;
+      if (h.getAttribute(NATIVE_COLLAPSE_HEADER_ATTR) !== NATIVE_ROLL_REGION_ID) h.remove();
+    }
+  }
+
+  function attachNativeCollapseRoll() {
+    if (!config.nativePanelCollapseEnabled) return false;
+
+    removeStaleNativeCollapseHeadersExceptRoll();
+
+    const roots = collectNativeCollapseRoots();
+    if (roots.length === 0) return false;
+
+    const rootSet = new Set(roots);
+
+    // 清理已消失或不再属于统一卷轴的旧 root 标记，同时恢复其显示。
+    for (const r of Array.from(document.querySelectorAll(`[${NATIVE_COLLAPSE_ROOT_ATTR}]`))) {
+      if (!(r instanceof HTMLElement)) continue;
+      if (rootSet.has(r)) continue;
+      const orig = r.dataset.pmgOriginalDisplay;
+      if (typeof orig === 'string') {
+        if (orig) r.style.display = orig;
+        else r.style.removeProperty('display');
+        delete r.dataset.pmgOriginalDisplay;
+      } else {
+        r.style.removeProperty('display');
+      }
+      r.removeAttribute(NATIVE_COLLAPSE_ROOT_ATTR);
+    }
+
+    let header = document.querySelector(`.${NATIVE_COLLAPSE_HEADER_CLASS}[${NATIVE_COLLAPSE_HEADER_ATTR}="${NATIVE_ROLL_REGION_ID}"]`);
+    if (!(header instanceof HTMLElement)) {
+      header = createNativeCollapseHeader(roots);
+    }
+
+    const firstRoot = roots[0];
+    if (firstRoot.parentElement && header.nextElementSibling !== firstRoot) {
+      firstRoot.parentElement.insertBefore(header, firstRoot);
+    }
+
+    for (const rootEl of roots) {
+      rootEl.setAttribute(NATIVE_COLLAPSE_ROOT_ATTR, NATIVE_ROLL_REGION_ID);
+    }
+
+    applyNativeRollVisualState(header, roots, isNativeRollCollapsed(), { animated: false });
+    return true;
+  }
+
+  function scanAndAttachNativeCollapse() {
+    if (!config.nativePanelCollapseEnabled) {
+      teardownNativePanelCollapse();
+      return false;
+    }
+    try {
+      return attachNativeCollapseRoll();
+    } catch (e) {
+      warn('attachNativeCollapseRoll failed:', e);
+      return false;
+    }
+  }
+
+  function debounceScanNativePanelCollapse(delayMs = 80) {
+    if (nativePanelCollapseScanTimer) clearTimeout(nativePanelCollapseScanTimer);
+    nativePanelCollapseScanTimer = setTimeout(() => {
+      nativePanelCollapseScanTimer = null;
+      scanAndAttachNativeCollapse();
+    }, delayMs);
+  }
+
+  function scheduleNativePanelCollapseRetry(durationMs = 8000, intervalMs = 300) {
+    if (!config.nativePanelCollapseEnabled) return;
+
+    nativePanelCollapseRetryUntil = Math.max(nativePanelCollapseRetryUntil, Date.now() + durationMs);
+    if (nativePanelCollapseRetryTimer) return;
+
+    const tick = () => {
+      nativePanelCollapseRetryTimer = null;
+      if (!config.nativePanelCollapseEnabled) return;
+
+      const attached = scanAndAttachNativeCollapse();
+      const headerExists = !!document.querySelector(`.${NATIVE_COLLAPSE_HEADER_CLASS}[${NATIVE_COLLAPSE_HEADER_ATTR}="${NATIVE_ROLL_REGION_ID}"]`);
+
+      // 右侧设置面板 / 预设设置 DOM 常常是异步分批渲染的：
+      // 初次扫描可能找不到全部 anchor，或 header 刚插入又被原生 render 覆盖。
+      // 因此在页面刷新、预设切换、body 大量变化后短时间重试，直到 header 稳定存在或超时。
+      if ((!attached || !headerExists) && Date.now() < nativePanelCollapseRetryUntil) {
+        nativePanelCollapseRetryTimer = setTimeout(tick, intervalMs);
+      }
+    };
+
+    nativePanelCollapseRetryTimer = setTimeout(tick, 0);
+  }
+
+  function teardownNativePanelCollapse() {
+    if (nativePanelCollapseRetryTimer) {
+      clearTimeout(nativePanelCollapseRetryTimer);
+      nativePanelCollapseRetryTimer = null;
+    }
+    nativePanelCollapseRetryUntil = 0;
+    // 移除已注入的统一卷轴 header；恢复每个 root 的 display。
+    const headers = document.querySelectorAll(`.${NATIVE_COLLAPSE_HEADER_CLASS}`);
+    for (const h of Array.from(headers)) {
+      if (h instanceof HTMLElement) h.remove();
+    }
+    const roots = document.querySelectorAll(`[${NATIVE_COLLAPSE_ROOT_ATTR}]`);
+    for (const r of Array.from(roots)) {
+      if (!(r instanceof HTMLElement)) continue;
+      const orig = r.dataset.pmgOriginalDisplay;
+      if (typeof orig === 'string') {
+        if (orig) r.style.display = orig;
+        else r.style.removeProperty('display');
+        delete r.dataset.pmgOriginalDisplay;
+      } else {
+        r.style.removeProperty('display');
+      }
+      r.style.removeProperty('max-height');
+      r.style.removeProperty('overflow');
+      r.style.removeProperty('opacity');
+      r.style.removeProperty('transition');
+      delete r.dataset.pmgNativeCollapseAnimationToken;
+      r.removeAttribute(NATIVE_COLLAPSE_ROOT_ATTR);
+    }
+  }
+
+
+  // ---------------------------------------------------------------------------
+  // Native OpenAI preset select enhancement
+  //
+  // 增强酒馆原生预设选择下拉栏：
+  // - 收藏预设置顶（不修改 option.text，避免破坏原生按 text 读取预设名的逻辑）
+  // - 在独立管理弹窗中对任意预设执行改名 / 导出 / 删除 / 另存为，不需要先切换到该预设
+  // ---------------------------------------------------------------------------
+
+  const NATIVE_PRESET_SELECT_ID = 'settings_preset_openai';
+  const NATIVE_PRESET_TOOLBAR_ID = 'pmg-native-preset-toolbar';
+  const NATIVE_PRESET_MODAL_ID = 'pmg-native-preset-manager-modal';
+  const NATIVE_PRESET_FAVORITES_GROUP_LABEL = '⭐ 收藏预设';
+  const NATIVE_PRESET_OTHERS_GROUP_LABEL = '全部预设';
+
+  /** @type {MutationObserver|null} */
+  let nativePresetSelectObserver = null;
+  /** @type {HTMLElement|null} */
+  let nativePresetManagerModalEl = null;
+  let nativePresetDepsPromise = null;
+  let nativePresetReorderTimer = null;
+  let nativePresetManagerSearchQuery = '';
+
+  const NATIVE_PRESET_SENSITIVE_FIELDS = [
+    'reverse_proxy',
+    'proxy_password',
+    'custom_url',
+    'custom_include_body',
+    'custom_exclude_body',
+    'custom_include_headers',
+    'vertexai_region',
+    'vertexai_express_project_id',
+    'azure_base_url',
+    'azure_deployment_name',
+  ];
+
+  function findNativePresetSelect() {
+    return document.getElementById(NATIVE_PRESET_SELECT_ID);
+  }
+
+  async function getNativePresetDeps() {
+    if (nativePresetDepsPromise) return nativePresetDepsPromise;
+    nativePresetDepsPromise = (async () => {
+      const [presetManagerMod, openaiMod, scriptMod, utilsMod, templatesMod, popupMod] = await Promise.all([
+        import('/scripts/preset-manager.js'),
+        import('/scripts/openai.js'),
+        import('/script.js'),
+        import('/scripts/utils.js'),
+        import('/scripts/templates.js'),
+        import('/scripts/popup.js'),
+      ]);
+      return {
+        getPresetManager: presetManagerMod.getPresetManager,
+        openaiMod,
+        getRequestHeaders: scriptMod.getRequestHeaders,
+        saveSettingsDebounced: scriptMod.saveSettingsDebounced,
+        eventSource: scriptMod.eventSource,
+        event_types: scriptMod.event_types,
+        download: utilsMod.download,
+        getSanitizedFilename: utilsMod.getSanitizedFilename,
+        renderTemplateAsync: templatesMod.renderTemplateAsync,
+        Popup: popupMod.Popup,
+        POPUP_TYPE: popupMod.POPUP_TYPE,
+        POPUP_RESULT: popupMod.POPUP_RESULT,
+      };
+    })();
+    return nativePresetDepsPromise;
+  }
+
+  function getNativePresetFavoriteSet() {
+    config.nativePresetFavorites = Array.isArray(config.nativePresetFavorites)
+      ? ensureArrayUnique(config.nativePresetFavorites).map(String).filter(Boolean)
+      : [];
+    return new Set(config.nativePresetFavorites);
+  }
+
+  function isNativePresetFavorite(name) {
+    return getNativePresetFavoriteSet().has(String(name || ''));
+  }
+
+  async function toggleNativePresetFavorite(name, options = {}) {
+    const key = String(name || '').trim();
+    if (!key) return;
+    const set = getNativePresetFavoriteSet();
+    if (set.has(key)) set.delete(key);
+    else set.add(key);
+    config.nativePresetFavorites = Array.from(set);
+    persistNoRefreshUiStateToLocalStorage();
+
+    // 关键：收藏/取消收藏预设时不要立即重排 #settings_preset_openai。
+    // 重排 select 会重建 option/optgroup，容易触发 SillyTavern 原生 OpenAI 设置面板联动刷新。
+    // 默认只更新收藏状态和插件自身 UI，行为与快捷收藏栏一致：点星标不切预设、不刷新请求页。
+    if (options?.refreshSelect) {
+      scheduleNativePresetSelectEnhance(0);
+    }
+  }
+
+  async function switchNativePresetByName(name) {
+    const key = String(name || '').trim();
+    if (!key) return false;
+
+    const select = findNativePresetSelect();
+    if (!(select instanceof HTMLSelectElement)) {
+      window.toastr?.warning?.('未找到原生 OpenAI 预设下拉栏');
+      return false;
+    }
+
+    const option = Array.from(select.querySelectorAll('option'))
+      .find((opt) => getNativePresetOptionName(opt) === key);
+    if (!(option instanceof HTMLOptionElement)) {
+      window.toastr?.warning?.(`预设不存在或尚未加载：${key}`);
+      return false;
+    }
+
+    const before = getNativePresetCurrentName();
+    if (before === key) {
+      refreshNativePresetToolbarState();
+      renderAllFavoritesPanels();
+      return true;
+    }
+
+    option.selected = true;
+    select.value = option.value;
+
+    const jq = getJQuery();
+    if (typeof jq === 'function') {
+      try {
+        jq(select).trigger('change');
+      } catch {
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    } else {
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    activePresetName = key;
+    refreshNativePresetToolbarState();
+    scheduleNativePresetSelectEnhance(80);
+
+    // 原生 change 会异步刷新 Prompt Manager；这里延迟同步收藏栏标题和提示词收藏范围。
+    setTimeout(() => {
+      void refreshActivePresetName(true).finally(() => {
+        renderAllFavoritesPanels();
+        debounceApply('native-preset-quick-switch', 0);
+      });
+    }, 180);
+
+    window.toastr?.success?.(`已切换预设：${key}`);
+    return true;
+  }
+
+  function renderNativePresetFavoritesQuickSection(body, options = {}) {
+    if (!(body instanceof HTMLElement)) return false;
+    const showEmpty = !!options.showEmpty;
+
+    const appendEmpty = (text) => {
+      if (!showEmpty) return false;
+      const empty = document.createElement('div');
+      empty.className = 'pmg-fav-empty';
+      empty.textContent = text;
+      body.appendChild(empty);
+      return true;
+    };
+
+    const favNamesRaw = ensureArrayUnique(
+      Array.isArray(config.nativePresetFavorites) ? config.nativePresetFavorites : []
+    ).map(String).map((x) => x.trim()).filter(Boolean);
+    if (favNamesRaw.length === 0) return appendEmpty('暂无收藏预设（可在原生预设下拉栏旁点击 ⭐ 收藏）');
+
+    const presetOptions = getNativePresetOptions();
+    if (presetOptions.length > 0) {
+      cleanupNativePresetFavoritesByOptions(presetOptions);
+    }
+
+    const optionNameSet = new Set(presetOptions.map((x) => x.name));
+    const favNames = presetOptions.length > 0
+      ? favNamesRaw.filter((name) => optionNameSet.has(name))
+      : favNamesRaw;
+    if (favNames.length === 0) return appendEmpty('收藏的预设不存在或尚未加载');
+
+    const currentName = getNativePresetCurrentName();
+
+    const section = document.createElement('div');
+    section.className = 'pmg-fav-section pmg-native-preset-quick-section';
+
+    for (const presetName of favNames) {
+      const row = document.createElement('div');
+      row.className = 'pmg-fav-row pmg-native-preset-quick-row';
+      row.classList.toggle('pmg-native-preset-quick-current', presetName === currentName);
+      row.title = presetName === currentName ? `当前预设：${presetName}` : `切换到预设：${presetName}`;
+
+      const icon = document.createElement('span');
+      icon.className = presetName === currentName
+        ? 'pmg-native-preset-quick-icon fa-solid fa-circle-check'
+        : 'pmg-native-preset-quick-icon fa-solid fa-wand-magic-sparkles';
+
+      const rowTitle = document.createElement('div');
+      rowTitle.className = 'pmg-fav-title pmg-native-preset-quick-title';
+      rowTitle.textContent = presetName;
+
+      const btnSwitch = document.createElement('span');
+      btnSwitch.className = presetName === currentName
+        ? 'pmg-native-preset-quick-switch fa-solid fa-check interactable'
+        : 'pmg-native-preset-quick-switch fa-solid fa-right-to-bracket interactable';
+      btnSwitch.title = presetName === currentName ? '当前正在使用' : '切换到此预设';
+      btnSwitch.tabIndex = 0;
+      btnSwitch.setAttribute('role', 'button');
+
+      const btnUnfav = document.createElement('span');
+      btnUnfav.className = 'pmg-fav-unfav fa-solid fa-star fa-xs interactable pmg-fav-on';
+      btnUnfav.title = '取消收藏此预设';
+      btnUnfav.tabIndex = 0;
+      btnUnfav.setAttribute('role', 'button');
+
+      const doSwitch = async (e) => {
+        if (e?.preventDefault) e.preventDefault();
+        if (e?.stopPropagation) e.stopPropagation();
+        await switchNativePresetByName(presetName);
+      };
+
+      row.addEventListener('click', (e) => {
+        const t = e.target;
+        if (t instanceof HTMLElement && t.closest('.pmg-fav-unfav')) return;
+        void doSwitch(e);
+      });
+      btnSwitch.addEventListener('click', doSwitch);
+      btnSwitch.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') void doSwitch(e);
+      });
+
+      btnUnfav.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        await toggleNativePresetFavorite(presetName);
+        renderAllFavoritesPanels();
+      });
+      btnUnfav.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') btnUnfav.click();
+      });
+
+      row.appendChild(icon);
+      row.appendChild(rowTitle);
+      row.appendChild(btnSwitch);
+      row.appendChild(btnUnfav);
+      section.appendChild(row);
+    }
+
+    body.appendChild(section);
+    return true;
+  }
+
+  function getNativePresetOptionName(option) {
+    return String(option?.textContent || '').trim();
+  }
+
+  function getNativePresetCurrentName() {
+    const select = findNativePresetSelect();
+    if (!(select instanceof HTMLSelectElement)) return '';
+    return getNativePresetOptionName(select.selectedOptions?.[0]);
+  }
+
+  function getNativePresetOptions(select = findNativePresetSelect()) {
+    if (!(select instanceof HTMLSelectElement)) return [];
+    return Array.from(select.querySelectorAll('option'))
+      .filter((opt) => opt instanceof HTMLOptionElement)
+      .map((opt) => ({
+        option: opt,
+        name: getNativePresetOptionName(opt),
+        value: String(opt.value ?? ''),
+        disabled: !!opt.disabled,
+        isGui: String(opt.value ?? '') === 'gui',
+      }))
+      .filter((x) => x.name);
+  }
+
+  function cleanupNativePresetFavoritesByOptions(options) {
+    const validNames = new Set((options || []).map((x) => x.name));
+    const prev = Array.isArray(config.nativePresetFavorites) ? config.nativePresetFavorites : [];
+    const next = ensureArrayUnique(prev.map(String).filter((x) => x && validNames.has(x)));
+    const changed = next.length !== prev.length || next.some((x, i) => x !== prev[i]);
+    config.nativePresetFavorites = next;
+    if (changed) persistNoRefreshUiStateToLocalStorage();
+  }
+
+  function applyNativePresetSelectOrder() {
+    if (!config.nativePresetEnhancedEnabled) return;
+    const select = findNativePresetSelect();
+    if (!(select instanceof HTMLSelectElement)) return;
+    if (select.dataset.pmgNativePresetReordering === '1') return;
+
+    const options = getNativePresetOptions(select);
+    if (options.length === 0) return;
+    cleanupNativePresetFavoritesByOptions(options);
+
+    const selectedValue = select.value;
+    const favSet = getNativePresetFavoriteSet();
+    const favOptions = [];
+    const otherOptions = [];
+
+    for (const info of options) {
+      info.option.classList.toggle('pmg-native-preset-favorite-option', favSet.has(info.name));
+      info.option.title = favSet.has(info.name) ? `⭐ ${info.name}` : info.name;
+      if (favSet.has(info.name)) favOptions.push(info.option);
+      else otherOptions.push(info.option);
+    }
+
+    try {
+      select.dataset.pmgNativePresetReordering = '1';
+      select.innerHTML = '';
+
+      if (favOptions.length > 0) {
+        const favGroup = document.createElement('optgroup');
+        favGroup.label = NATIVE_PRESET_FAVORITES_GROUP_LABEL;
+        for (const opt of favOptions) favGroup.appendChild(opt);
+        select.appendChild(favGroup);
+
+        const otherGroup = document.createElement('optgroup');
+        otherGroup.label = NATIVE_PRESET_OTHERS_GROUP_LABEL;
+        for (const opt of otherOptions) otherGroup.appendChild(opt);
+        select.appendChild(otherGroup);
+      } else {
+        for (const opt of otherOptions) select.appendChild(opt);
+      }
+
+      select.value = selectedValue;
+      refreshNativePresetToolbarState();
+    } finally {
+      delete select.dataset.pmgNativePresetReordering;
+    }
+  }
+
+  function teardownNativePresetSelectEnhancer() {
+    nativePresetSelectObserver?.disconnect();
+    nativePresetSelectObserver = null;
+    document.getElementById(NATIVE_PRESET_TOOLBAR_ID)?.remove();
+
+    const select = findNativePresetSelect();
+    if (!(select instanceof HTMLSelectElement)) return;
+
+    const selectedValue = select.value;
+    const options = getNativePresetOptions(select)
+      .map((x) => x.option)
+      .sort((a, b) => {
+        const av = String(a.value ?? '');
+        const bv = String(b.value ?? '');
+        if (av === 'gui') return -1;
+        if (bv === 'gui') return 1;
+        const an = Number(av);
+        const bn = Number(bv);
+        if (Number.isFinite(an) && Number.isFinite(bn)) return an - bn;
+        return getNativePresetOptionName(a).localeCompare(getNativePresetOptionName(b));
+      });
+
+    try {
+      select.dataset.pmgNativePresetReordering = '1';
+      select.innerHTML = '';
+      for (const opt of options) {
+        opt.classList.remove('pmg-native-preset-favorite-option');
+        opt.title = getNativePresetOptionName(opt);
+        select.appendChild(opt);
+      }
+      select.value = selectedValue;
+      delete select.dataset.pmgNativePresetEnhancerAttached;
+    } finally {
+      delete select.dataset.pmgNativePresetReordering;
+    }
+  }
+
+  function refreshNativePresetToolbarState() {
+    const toolbar = document.getElementById(NATIVE_PRESET_TOOLBAR_ID);
+    if (!(toolbar instanceof HTMLElement)) return;
+    const currentName = getNativePresetCurrentName();
+    const star = toolbar.querySelector('[data-pmg-native-preset-action="toggle-current-favorite"]');
+    if (star instanceof HTMLElement) {
+      const fav = isNativePresetFavorite(currentName);
+      star.classList.toggle('pmg-native-preset-current-fav-on', fav);
+      star.classList.toggle('pmg-native-preset-current-fav-off', !fav);
+      star.title = fav ? `取消置顶收藏：${currentName}` : `置顶收藏当前预设：${currentName}`;
+      star.setAttribute('aria-pressed', String(fav));
+    }
+  }
+
+  function ensureNativePresetToolbar() {
+    if (!config.nativePresetEnhancedEnabled) {
+      document.getElementById(NATIVE_PRESET_TOOLBAR_ID)?.remove();
+      return;
+    }
+
+    const select = findNativePresetSelect();
+    if (!(select instanceof HTMLSelectElement)) return;
+    const host = select.closest('.flex-container') || select.parentElement;
+    if (!(host instanceof HTMLElement)) return;
+
+    let toolbar = document.getElementById(NATIVE_PRESET_TOOLBAR_ID);
+    if (!(toolbar instanceof HTMLElement)) {
+      toolbar = document.createElement('div');
+      toolbar.id = NATIVE_PRESET_TOOLBAR_ID;
+      toolbar.className = 'pmg-native-preset-toolbar flex-container flexNoGap';
+
+      const star = document.createElement('div');
+      star.className = 'menu_button menu_button_icon pmg-native-preset-current-fav-off';
+      star.setAttribute('data-pmg-native-preset-action', 'toggle-current-favorite');
+      star.setAttribute('role', 'button');
+      star.tabIndex = 0;
+      star.innerHTML = '<i class="fa-fw fa-solid fa-star"></i>';
+      const toggleCurrent = async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const name = getNativePresetCurrentName();
+        if (!name) return;
+        await toggleNativePresetFavorite(name);
+        refreshNativePresetToolbarState();
+        renderNativePresetManagerIfOpen();
+        renderAllFavoritesPanels();
+      };
+      star.addEventListener('click', toggleCurrent);
+      star.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') void toggleCurrent(e);
+      });
+
+      const manager = document.createElement('div');
+      manager.className = 'menu_button menu_button_icon';
+      manager.title = '管理预设（改名 / 导出 / 删除 / 另存为）';
+      manager.setAttribute('data-pmg-native-preset-action', 'open-manager');
+      manager.setAttribute('role', 'button');
+      manager.tabIndex = 0;
+      manager.innerHTML = '<i class="fa-fw fa-solid fa-list-check"></i>';
+      const open = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openNativePresetManager();
+      };
+      manager.addEventListener('click', open);
+      manager.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') open(e);
+      });
+
+      toolbar.appendChild(star);
+      toolbar.appendChild(manager);
+    }
+
+    if (toolbar.parentElement !== host) {
+      host.appendChild(toolbar);
+    }
+
+    refreshNativePresetToolbarState();
+  }
+
+  function scheduleNativePresetSelectEnhance(delayMs = 80) {
+    if (nativePresetReorderTimer) clearTimeout(nativePresetReorderTimer);
+    nativePresetReorderTimer = setTimeout(() => {
+      nativePresetReorderTimer = null;
+      try {
+        ensureNativePresetToolbar();
+        applyNativePresetSelectOrder();
+      } catch (e) {
+        warn('Native preset select enhance failed:', e);
+      }
+    }, delayMs);
+  }
+
+  function attachNativePresetSelectEnhancer() {
+    if (!config.nativePresetEnhancedEnabled) {
+      teardownNativePresetSelectEnhancer();
+      return false;
+    }
+    const select = findNativePresetSelect();
+    if (!(select instanceof HTMLSelectElement)) return false;
+
+    let shouldInitialEnhance = false;
+
+    if (select.dataset.pmgNativePresetEnhancerAttached !== '1') {
+      select.addEventListener('change', () => {
+        refreshNativePresetToolbarState();
+        scheduleNativePresetSelectEnhance(80);
+        if (config.nativePanelCollapseEnabled) {
+          debounceScanNativePanelCollapse(120);
+          scheduleNativePanelCollapseRetry(5000, 300);
+        }
+      });
+      select.dataset.pmgNativePresetEnhancerAttached = '1';
+      shouldInitialEnhance = true;
+    }
+
+    if (!nativePresetSelectObserver || nativePresetSelectObserver.__pmgTarget !== select) {
+      nativePresetSelectObserver?.disconnect();
+      nativePresetSelectObserver = new MutationObserver(() => {
+        if (select.dataset.pmgNativePresetReordering === '1') return;
+        scheduleNativePresetSelectEnhance(80);
+      });
+      nativePresetSelectObserver.__pmgTarget = select;
+      nativePresetSelectObserver.observe(select, { childList: true, subtree: true, characterData: true });
+      shouldInitialEnhance = true;
+    }
+
+    if (shouldInitialEnhance) {
+      scheduleNativePresetSelectEnhance(0);
+    }
+    return true;
+  }
+
+  function getOpenAiPresetIndex(openaiMod, name) {
+    const map = openaiMod?.openai_setting_names;
+    if (!map || typeof map !== 'object') return undefined;
+    return Object.prototype.hasOwnProperty.call(map, name) ? map[name] : undefined;
+  }
+
+  async function getOpenAiPresetDataByName(name) {
+    const { openaiMod } = await getNativePresetDeps();
+    const idx = getOpenAiPresetIndex(openaiMod, name);
+    if (idx === undefined || idx === null) throw new Error(`预设不存在：${name}`);
+    const preset = openaiMod.openai_settings?.[idx];
+    if (!preset || typeof preset !== 'object') throw new Error(`预设数据不可用：${name}`);
+    return safeJsonClone(preset);
+  }
+
+  async function saveOpenAiPresetData(name, preset) {
+    const deps = await getNativePresetDeps();
+    const response = await fetch('/api/presets/save', {
+      method: 'POST',
+      headers: deps.getRequestHeaders(),
+      body: JSON.stringify({ apiId: 'openai', name, preset }),
+    });
+    if (!response.ok) throw new Error('保存预设失败');
+    const data = await response.json().catch(() => ({}));
+    return String(data?.name || name);
+  }
+
+  async function deleteOpenAiPresetFromServer(name) {
+    const deps = await getNativePresetDeps();
+    const response = await fetch('/api/presets/delete', {
+      method: 'POST',
+      headers: deps.getRequestHeaders(),
+      body: JSON.stringify({ apiId: 'openai', name }),
+    });
+    return response.ok;
+  }
+
+  function upsertNativePresetOption(name, index, selected = false) {
+    const select = findNativePresetSelect();
+    if (!(select instanceof HTMLSelectElement)) return;
+    let option = Array.from(select.querySelectorAll('option')).find((opt) => getNativePresetOptionName(opt) === name);
+    if (!(option instanceof HTMLOptionElement)) {
+      option = document.createElement('option');
+      select.appendChild(option);
+    }
+    option.value = String(index);
+    option.text = String(name);
+    option.selected = !!selected;
+  }
+
+  function removeNativePresetOptionByName(name) {
+    const select = findNativePresetSelect();
+    if (!(select instanceof HTMLSelectElement)) return;
+    for (const opt of Array.from(select.querySelectorAll('option'))) {
+      if (getNativePresetOptionName(opt) === name) opt.remove();
+    }
+  }
+
+  async function nativePresetRename(oldName, requestedNewName) {
+    const deps = await getNativePresetDeps();
+    let newName = String(requestedNewName || '').trim();
+    if (typeof deps.getSanitizedFilename === 'function') {
+      newName = await deps.getSanitizedFilename(newName);
+    }
+    newName = String(newName || '').trim();
+    if (!newName || oldName === newName) return;
+    if (getOpenAiPresetIndex(deps.openaiMod, newName) !== undefined) throw new Error('同名预设已存在');
+
+    const preset = await getOpenAiPresetDataByName(oldName);
+    await deps.eventSource?.emit?.(deps.event_types?.PRESET_RENAMED_BEFORE, { apiId: 'openai', oldName, newName });
+    const savedName = await saveOpenAiPresetData(newName, preset);
+    const oldIdx = getOpenAiPresetIndex(deps.openaiMod, oldName);
+    if (oldIdx === undefined || oldIdx === null) throw new Error('旧预设索引丢失');
+
+    deps.openaiMod.openai_settings[oldIdx] = preset;
+    delete deps.openaiMod.openai_setting_names[oldName];
+    deps.openaiMod.openai_setting_names[savedName] = oldIdx;
+
+    const select = findNativePresetSelect();
+    const oldOption = Array.from(select?.querySelectorAll?.('option') || []).find((opt) => getNativePresetOptionName(opt) === oldName);
+    if (oldOption instanceof HTMLOptionElement) oldOption.text = savedName;
+
+    if (deps.openaiMod.oai_settings?.preset_settings_openai === oldName) {
+      deps.openaiMod.oai_settings.preset_settings_openai = savedName;
+      if (oldOption instanceof HTMLOptionElement) oldOption.selected = true;
+      deps.saveSettingsDebounced?.();
+    }
+
+    await deleteOpenAiPresetFromServer(oldName);
+    config.nativePresetFavorites = (config.nativePresetFavorites || []).map((x) => x === oldName ? savedName : x);
+    await saveConfig();
+    await deps.eventSource?.emit?.(deps.event_types?.PRESET_RENAMED, { apiId: 'openai', oldName, newName: savedName });
+    window.toastr?.success?.('预设已改名');
+    scheduleNativePresetSelectEnhance(0);
+  }
+
+  async function nativePresetSaveAs(sourceName, requestedName) {
+    const deps = await getNativePresetDeps();
+    let newName = String(requestedName || '').trim();
+    if (typeof deps.getSanitizedFilename === 'function') {
+      newName = await deps.getSanitizedFilename(newName);
+    }
+    newName = String(newName || '').trim();
+    if (!newName) return;
+
+    const preset = await getOpenAiPresetDataByName(sourceName);
+    const existingIdx = getOpenAiPresetIndex(deps.openaiMod, newName);
+    if (existingIdx !== undefined && !confirm(`预设“${newName}”已存在。是否覆盖？`)) return;
+
+    const savedName = await saveOpenAiPresetData(newName, preset);
+    let idx = getOpenAiPresetIndex(deps.openaiMod, savedName);
+    if (idx !== undefined) {
+      deps.openaiMod.openai_settings[idx] = preset;
+    } else if (existingIdx !== undefined) {
+      idx = existingIdx;
+      deps.openaiMod.openai_settings[idx] = preset;
+      deps.openaiMod.openai_setting_names[savedName] = idx;
+    } else {
+      deps.openaiMod.openai_settings.push(preset);
+      idx = deps.openaiMod.openai_settings.length - 1;
+      deps.openaiMod.openai_setting_names[savedName] = idx;
+    }
+    upsertNativePresetOption(savedName, idx, false);
+    window.toastr?.success?.('预设已另存为');
+    scheduleNativePresetSelectEnhance(0);
+  }
+
+  async function nativePresetExport(name) {
+    const deps = await getNativePresetDeps();
+    const preset = await getOpenAiPresetDataByName(name);
+    const Popup = deps.Popup || window.Popup;
+    const POPUP_TYPE = deps.POPUP_TYPE || window.POPUP_TYPE;
+    const POPUP_RESULT = deps.POPUP_RESULT || window.POPUP_RESULT || { AFFIRMATIVE: 1, CANCELLED: 0 };
+
+    const sensitive = NATIVE_PRESET_SENSITIVE_FIELDS.filter((field) => preset[field]);
+    if (sensitive.length > 0 && Popup?.show?.confirm) {
+      const textHeader = '此预设包含代理或自定义端点设置';
+      const textMessage = [
+        '<div>是否在导出前移除这些字段？</div>',
+        '<br>',
+        sensitive.map((field) => `<b>${escapeHtmlLocal(field)}</b>`).join('<br>'),
+      ].join('');
+      const cancelButton = { text: '取消导出', result: POPUP_RESULT.CANCELLED, appendAtEnd: true };
+      const popupOptions = { customButtons: [cancelButton], okButton: '移除后导出', cancelButton: '保留并导出' };
+      const popupResult = await Popup.show.confirm(textHeader, textMessage, popupOptions);
+
+      if (popupResult === POPUP_RESULT.CANCELLED) {
+        return;
+      }
+
+      if (popupResult === POPUP_RESULT.AFFIRMATIVE || popupResult === true) {
+        for (const field of NATIVE_PRESET_SENSITIVE_FIELDS) delete preset[field];
+      }
+    } else if (sensitive.length > 0 && confirm(`预设包含代理或自定义端点字段：\n${sensitive.join('\n')}\n\n是否在导出前移除这些敏感字段？`)) {
+      for (const field of NATIVE_PRESET_SENSITIVE_FIELDS) delete preset[field];
+    }
+
+    // 复用酒馆原生导出窗口模板（public/scripts/openai.js 的 onExportPresetClick 同款 exportPreset 模板）
+    let removeConnectionData = false;
+    if (typeof deps.renderTemplateAsync === 'function' && Popup && POPUP_TYPE) {
+      const jq = getJQuery();
+      if (typeof jq === 'function') {
+        const exportConnectionTemplate = jq(await deps.renderTemplateAsync('exportPreset'));
+        await new Popup(exportConnectionTemplate, POPUP_TYPE.TEXT).show();
+        removeConnectionData = exportConnectionTemplate.find('input[name="export_connection_data"]:checked').val() === 'false';
+      }
+    } else {
+      removeConnectionData = confirm('是否移除连接相关设置后导出？\n（选择“确定”=更适合分享；“取消”=完整导出）');
+    }
+
+    if (removeConnectionData) {
+      const settingsToUpdate = deps.openaiMod?.settingsToUpdate || {};
+      for (const [, tuple] of Object.entries(settingsToUpdate)) {
+        const settingName = tuple?.[1];
+        const isConnection = !!tuple?.[3];
+        if (settingName && isConnection) delete preset[settingName];
+      }
+    }
+
+    await deps.eventSource?.emit?.(deps.event_types?.OAI_PRESET_EXPORT_READY, preset);
+    const json = JSON.stringify(preset, null, 4);
+    const filename = `${String(name || 'preset')}.json`;
+    if (typeof deps.download === 'function') {
+      deps.download(json, filename, 'application/json');
+    } else {
+      const blob = new Blob([json], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    }
+  }
+
+  async function nativePresetDelete(name) {
+    const deps = await getNativePresetDeps();
+    if (!confirm(`确认删除预设“${name}”？\n此操作不可逆。`)) return;
+    const selectedName = getNativePresetCurrentName();
+    const ok = await deleteOpenAiPresetFromServer(name);
+    if (!ok) throw new Error('服务器删除失败');
+
+    delete deps.openaiMod.openai_setting_names[name];
+    removeNativePresetOptionByName(name);
+    config.nativePresetFavorites = (config.nativePresetFavorites || []).filter((x) => x !== name);
+    await saveConfig();
+
+    if (selectedName === name) {
+      const select = findNativePresetSelect();
+      const next = select?.querySelector?.('option');
+      if (select instanceof HTMLSelectElement && next instanceof HTMLOptionElement) {
+        next.selected = true;
+        deps.openaiMod.oai_settings.preset_settings_openai = getNativePresetOptionName(next);
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
+
+    await deps.eventSource?.emit?.(deps.event_types?.PRESET_DELETED, { apiId: 'openai', name });
+    deps.saveSettingsDebounced?.();
+    window.toastr?.success?.('预设已删除');
+    scheduleNativePresetSelectEnhance(0);
+  }
+
+  function renderNativePresetManagerIfOpen() {
+    const modal = nativePresetManagerModalEl || document.getElementById(NATIVE_PRESET_MODAL_ID);
+    if (!(modal instanceof HTMLElement) || modal.classList.contains('pmg-hidden')) return;
+    const body = getModalBody(modal);
+    if (body) renderNativePresetManagerUI(body);
+  }
+
+  function ensureNativePresetManagerHeaderHint() {
+    const modal = nativePresetManagerModalEl || document.getElementById(NATIVE_PRESET_MODAL_ID);
+    if (!(modal instanceof HTMLElement)) return;
+    const header = modal.querySelector('.pmg-modal-header');
+    const close = modal.querySelector('.pmg-modal-close');
+    if (!(header instanceof HTMLElement)) return;
+
+    let hint = header.querySelector('.pmg-native-preset-manager-title-hint');
+    if (!(hint instanceof HTMLElement)) {
+      hint = document.createElement('small');
+      hint.className = 'pmg-native-preset-manager-title-hint';
+      if (close instanceof HTMLElement) header.insertBefore(hint, close);
+      else header.appendChild(hint);
+    }
+    hint.textContent = '⭐ 收藏会在选择栏置顶';
+  }
+
+  function openNativePresetManager() {
+    nativePresetManagerModalEl = ensureModalBase(NATIVE_PRESET_MODAL_ID);
+    const body = getModalBody(nativePresetManagerModalEl);
+    if (body) renderNativePresetManagerUI(body);
+    showModal(nativePresetManagerModalEl, '预设管理');
+    ensureNativePresetManagerHeaderHint();
+  }
+
+  function normalizeNativePresetSearchText(value) {
+    return String(value || '').toLocaleLowerCase().replace(/\s+/g, ' ').trim();
+  }
+
+  function isNativePresetFuzzyMatch(text, query) {
+    const haystack = normalizeNativePresetSearchText(text);
+    const needle = normalizeNativePresetSearchText(query);
+    if (!needle) return true;
+    if (!haystack) return false;
+
+    const terms = needle.split(' ').filter(Boolean);
+    return terms.every((term) => {
+      if (haystack.includes(term)) return true;
+      let j = 0;
+      for (let i = 0; i < haystack.length && j < term.length; i++) {
+        if (haystack[i] === term[j]) j++;
+      }
+      return j === term.length;
+    });
+  }
+
+  function applyNativePresetManagerSearchFilter(listEl, query) {
+    if (!(listEl instanceof HTMLElement)) return;
+    const rows = Array.from(listEl.querySelectorAll('.pmg-native-preset-row'));
+    let visibleCount = 0;
+    for (const row of rows) {
+      if (!(row instanceof HTMLElement)) continue;
+      const name = row.dataset.pmgPresetName || '';
+      const visible = isNativePresetFuzzyMatch(name, query);
+      row.style.display = visible ? '' : 'none';
+      if (visible) visibleCount++;
+    }
+
+    let empty = listEl.querySelector('.pmg-native-preset-search-empty');
+    if (visibleCount === 0 && rows.length > 0) {
+      if (!(empty instanceof HTMLElement)) {
+        empty = document.createElement('div');
+        empty.className = 'pmg-fav-empty pmg-native-preset-search-empty';
+        listEl.appendChild(empty);
+      }
+      empty.textContent = '没有匹配的预设';
+      empty.style.display = '';
+    } else if (empty instanceof HTMLElement) {
+      empty.style.display = 'none';
+    }
+  }
+
+  function renderNativePresetManagerUI(container) {
+    const options = getNativePresetOptions();
+    const currentName = getNativePresetCurrentName();
+    const existingSearch = container.querySelector('[data-pmg-native-preset-search]');
+    if (existingSearch instanceof HTMLInputElement) {
+      nativePresetManagerSearchQuery = existingSearch.value;
+    }
+    container.innerHTML = '';
+
+    const wrap = document.createElement('div');
+    wrap.className = 'pmg-native-preset-manager';
+
+    const searchWrap = document.createElement('div');
+    searchWrap.className = 'pmg-native-preset-manager-search-wrap';
+
+    const searchInput = document.createElement('input');
+    searchInput.type = 'search';
+    searchInput.className = 'text_pole pmg-native-preset-manager-search';
+    searchInput.placeholder = '搜索预设（支持模糊搜索）';
+    searchInput.value = nativePresetManagerSearchQuery || '';
+    searchInput.setAttribute('data-pmg-native-preset-search', '1');
+    searchWrap.appendChild(searchInput);
+    wrap.appendChild(searchWrap);
+
+    const list = document.createElement('div');
+    list.className = 'pmg-native-preset-manager-list';
+
+    if (options.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'pmg-fav-empty';
+      empty.textContent = '未找到 OpenAI 预设列表';
+      list.appendChild(empty);
+    }
+
+    for (const info of options) {
+      const row = document.createElement('div');
+      row.className = 'pmg-native-preset-row';
+      row.dataset.pmgPresetName = info.name;
+      if (info.name === currentName) row.classList.add('pmg-native-preset-row-current');
+
+      const star = document.createElement('span');
+      star.className = 'pmg-native-preset-row-star fa-solid fa-star interactable';
+      star.title = isNativePresetFavorite(info.name) ? '取消置顶收藏' : '置顶收藏';
+      star.classList.toggle('pmg-fav-on', isNativePresetFavorite(info.name));
+      star.classList.toggle('pmg-fav-off', !isNativePresetFavorite(info.name));
+      star.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        await toggleNativePresetFavorite(info.name);
+        nativePresetManagerSearchQuery = searchInput.value;
+        renderNativePresetManagerUI(container);
+      });
+
+      const title = document.createElement('div');
+      title.className = 'pmg-native-preset-row-title';
+      title.textContent = info.name;
+      title.title = info.name;
+      if (info.name === currentName) {
+        const badge = document.createElement('small');
+        badge.className = 'pmg-native-preset-current-badge';
+        badge.textContent = '当前';
+        title.appendChild(badge);
+      }
+
+      const actions = document.createElement('div');
+      actions.className = 'pmg-native-preset-row-actions';
+
+      const addBtn = (label, titleText, cls, fn) => {
+        const btn = document.createElement('div');
+        btn.className = `menu_button ${cls || ''}`.trim();
+        btn.textContent = label;
+        btn.title = titleText;
+        btn.addEventListener('click', async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          try {
+            await fn();
+            renderNativePresetManagerIfOpen();
+          } catch (err) {
+            warn('Native preset action failed:', err);
+            window.toastr?.error?.(String(err?.message || err));
+          }
+        });
+        actions.appendChild(btn);
+      };
+
+      addBtn('改名', '不切换预设，直接改名此预设', '', async () => {
+        const newName = prompt('输入新的预设名：', info.name);
+        if (!newName) return;
+        await nativePresetRename(info.name, newName);
+      });
+      addBtn('导出', '导出此预设', '', async () => nativePresetExport(info.name));
+      addBtn('另存为', '以此预设为源另存为新预设', '', async () => {
+        const newName = prompt('另存为预设名：', `${info.name} - copy`);
+        if (!newName) return;
+        await nativePresetSaveAs(info.name, newName);
+      });
+      addBtn('删除', '删除此预设', 'caution', async () => nativePresetDelete(info.name));
+
+      row.appendChild(star);
+      row.appendChild(title);
+      row.appendChild(actions);
+      list.appendChild(row);
+    }
+
+    wrap.appendChild(list);
+    container.appendChild(wrap);
+
+    searchInput.addEventListener('input', () => {
+      nativePresetManagerSearchQuery = searchInput.value;
+      applyNativePresetManagerSearchFilter(list, nativePresetManagerSearchQuery);
+    });
+    applyNativePresetManagerSearchFilter(list, nativePresetManagerSearchQuery);
+  }
+
+
+  // ---------------------------------------------------------------------------
   // Settings panel
   // ---------------------------------------------------------------------------
 
@@ -3564,41 +5808,32 @@
   </div>
 
   <div class="pmg-settings-section">
-    <div class="pmg-settings-section-title">📁 分组</div>
-    <div class="pmg-settings-row">
-      <label class="checkbox_label">
+    <div class="pmg-settings-section-title-row">
+      <div class="pmg-settings-section-title">📁 分组</div>
+      <label class="pmg-main-toggle-button">
         <input type="checkbox" id="pmg_grouping_enabled">
-        <span>启用分组（启用后将禁用原生拖拽）</span>
+        <span>启用分组</span>
       </label>
     </div>
 
-    <div class="inline-drawer pmg-settings-drawer">
-      <div class="inline-drawer-toggle inline-drawer-header" data-pmg-drawer="grouping_options">
-        <b>更多分组选项</b>
-        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+    <div class="pmg-settings-subsection">
+      <div class="pmg-settings-subsection-title">更多分组选项</div>
+      <div class="pmg-settings-row">
+        <label class="checkbox_label">
+          <input type="checkbox" id="pmg_second_level">
+          <span>启用二级分组</span>
+        </label>
       </div>
-      <div class="inline-drawer-content" data-pmg-drawer-content="grouping_options" style="display:none;">
-        <div class="pmg-settings-row">
-          <label class="checkbox_label">
-            <input type="checkbox" id="pmg_second_level">
-            <span>启用二级分组</span>
-          </label>
-        </div>
-        <div class="pmg-settings-row">
-          <label class="checkbox_label">
-            <input type="checkbox" id="pmg_hide_prefix">
-            <span>分组时隐藏前缀（仅显示，不修改原名称）</span>
-          </label>
-        </div>
+      <div class="pmg-settings-row">
+        <label class="checkbox_label">
+          <input type="checkbox" id="pmg_hide_prefix">
+          <span>分组时隐藏前缀（仅显示，不修改原名称）</span>
+        </label>
       </div>
     </div>
 
-    <div class="inline-drawer pmg-settings-drawer">
-      <div class="inline-drawer-toggle inline-drawer-header" data-pmg-drawer="prefix_rules">
-        <b>前缀解析规则</b>
-        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-      </div>
-      <div class="inline-drawer-content" data-pmg-drawer-content="prefix_rules" style="display:none;">
+    <div class="pmg-settings-subsection">
+      <div class="pmg-settings-subsection-title">前缀解析规则</div>
         <div class="pmg-settings-row">
           <label class="checkbox_label">
             <input type="checkbox" id="pmg_prefix_bracket">
@@ -3634,82 +5869,115 @@
           </div>
           <div style="margin-left: 28px; opacity: 0.85;"><small>支持用逗号分隔多个分隔符（例如：<code>=,＝</code>）</small></div>
         </div>
-      </div>
     </div>
 
-    <div class="inline-drawer pmg-settings-drawer">
-      <div class="inline-drawer-toggle inline-drawer-header" data-pmg-drawer="help">
-        <b>命名示例 / 帮助</b>
-        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-      </div>
-      <div class="inline-drawer-content pmg-settings-hint" data-pmg-drawer-content="help" style="display:none;">
-        <small>
-          <b>命名示例：</b><br>
-          1）<code>【常用】阡濯自制</code> → 一级组：<code>常用</code><br>
-          2）<code>文生图-测试1</code> → 一级组：<code>文生图</code><br>
-          3）<code>文生图-【常用】测试2</code> → 组：<code>文生图 / 常用</code><br>
-          4）<code>【文生图】常用-测试3</code> → 组：<code>文生图 / 常用</code><br>
-          5）<code>常用=测试4</code> → 一级组：<code>常用</code>（需启用自定义分隔符）<br>
-          6）<code>「常用」测试5</code> → 一级组：<code>常用</code>（需启用自定义包裹前缀）<br>
-        </small>
-      </div>
+    <div class="pmg-settings-subsection pmg-settings-hint">
+      <div class="pmg-settings-subsection-title">命名示例 / 帮助</div>
+      <small>
+        1）<code>【常用】阡濯自制</code> → 一级组：<code>常用</code><br>
+        2）<code>文生图-测试1</code> → 一级组：<code>文生图</code><br>
+        3）<code>文生图-【常用】测试2</code> → 组：<code>文生图 / 常用</code><br>
+        4）<code>【文生图】常用-测试3</code> → 组：<code>文生图 / 常用</code><br>
+        5）<code>常用=测试4</code> → 一级组：<code>常用</code>（需启用自定义分隔符）<br>
+        6）<code>「常用」测试5</code> → 一级组：<code>常用</code>（需启用自定义包裹前缀）<br>
+      </small>
     </div>
 
   </div>
 
   <div class="pmg-settings-section">
-    <div class="pmg-settings-section-title">⭐ 收藏 / 快捷栏</div>
-    <div class="pmg-settings-row">
-      <label class="checkbox_label">
+    <div class="pmg-settings-section-title-row">
+      <div class="pmg-settings-section-title">↕️ 拖拽排序</div>
+    </div>
+
+    <div class="pmg-settings-subsection">
+      <div class="pmg-settings-row">
+        <label class="checkbox_label">
+          <input type="checkbox" id="pmg_disable_native_drag">
+          <span>防止误触功能 - 禁用拖拽预设条目</span>
+        </label>
+      </div>
+    </div>
+  </div>
+
+  <div class="pmg-settings-section">
+    <div class="pmg-settings-section-title-row">
+      <div class="pmg-settings-section-title">🗂️ 原生预设界面区域折叠</div>
+      <label class="pmg-main-toggle-button">
+        <input type="checkbox" id="pmg_native_panel_collapse_enabled">
+        <span>启用区域折叠</span>
+      </label>
+    </div>
+
+    <div class="pmg-settings-subsection pmg-settings-hint">
+      <small>
+        启用后，会在聊天补全设置面板内插入一个折叠头，可以折叠酒馆以下区域：<br>
+        • 聊天行为与功能（角色名称 / 继续后缀 / 联网搜索 / 函数调用 / 推理强度 等）<br>
+        • 快速提示词编辑<br>
+        • 实用提示词<br>
+        • Seed（随机种子）<br>
+        • Logit Bias（词符偏置）<br>
+        点击这个折叠头时，上述区域会像卷轴一样整体展开或收起，状态会自动记忆。
+      </small>
+    </div>
+  </div>
+
+  <div class="pmg-settings-section">
+    <div class="pmg-settings-section-title-row">
+      <div class="pmg-settings-section-title">⭐ 原生预设下拉栏增强</div>
+      <label class="pmg-main-toggle-button">
+        <input type="checkbox" id="pmg_native_preset_enhanced_enabled">
+        <span>启用增强</span>
+      </label>
+    </div>
+
+    <div class="pmg-settings-subsection pmg-settings-hint">
+      <small>
+        启用后：<br>
+        • 可以把常用预设置顶收藏/快速切换；<br>
+        • 可以打开“预设管理”弹窗，对任意预设执行改名 / 导出 / 删除 / 另存为，无需先切换到该预设。<br>
+      </small>
+    </div>
+  </div>
+
+  <div class="pmg-settings-section">
+    <div class="pmg-settings-section-title-row">
+      <div class="pmg-settings-section-title">⭐ 收藏 / 快捷栏</div>
+      <label class="pmg-main-toggle-button">
         <input type="checkbox" id="pmg_favorites_enabled">
         <span>启用收藏（提示词条目右侧显示\u2B50）</span>
       </label>
     </div>
 
-    <div class="inline-drawer pmg-settings-drawer">
-      <div class="inline-drawer-toggle inline-drawer-header" data-pmg-drawer="favorites_options">
-        <b>更多收藏选项</b>
-        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+    <div class="pmg-settings-subsection">
+      <div class="pmg-settings-subsection-title">更多收藏选项</div>
+      <div class="pmg-settings-row">
+        <label class="checkbox_label">
+          <input type="checkbox" id="pmg_favorites_panel">
+          <span>显示"内联收藏栏"（预设面板内）</span>
+        </label>
       </div>
-      <div class="inline-drawer-content" data-pmg-drawer-content="favorites_options" style="display:none;">
-        <div class="pmg-settings-row">
-          <label class="checkbox_label">
-            <input type="checkbox" id="pmg_favorites_panel">
-            <span>显示"内联收藏栏"（预设面板内）</span>
-          </label>
-        </div>
-        <div class="pmg-settings-row">
-          <label class="checkbox_label">
-            <input type="checkbox" id="pmg_floating_panel">
-            <span>显示"浮动收藏快捷栏"（不需打开预设面板即可使用）</span>
-          </label>
-        </div>
-        <div class="pmg-settings-row" style="margin-left: 28px;">
-          <div style="opacity: 0.9; margin-bottom: 4px;">快捷收藏栏按钮位置</div>
-          <select class="text_pole" id="pmg_quick_fav_btn_place" style="width: min(420px, 100%);">
-            <option value="floating">悬浮自由位置（可拖拽）</option>
-            <option value="qr">QR 栏</option>
-            <option value="send">发送按钮旁</option>
-          </select>
-          <div style="opacity: 0.75; margin-top: 4px;"><small>提示：切换到 QR/发送按钮旁后将禁用拖拽（切回悬浮后恢复上次悬浮位置）。</small></div>
-        </div>
-        <div class="pmg-settings-row">
-          <label class="checkbox_label">
-            <input type="checkbox" id="pmg_favorites_expand_default">
-            <span>收藏栏：分组默认展开</span>
-          </label>
-        </div>
+      <div class="pmg-settings-row">
+        <label class="checkbox_label">
+          <input type="checkbox" id="pmg_floating_panel">
+          <span>显示"浮动收藏快捷栏"（不需打开预设面板即可使用）</span>
+        </label>
       </div>
-    </div>
-  </div>
-
-  <div class="pmg-settings-section">
-    <div class="pmg-settings-section-title">⚡ 性能</div>
-    <div class="pmg-settings-row">
-      <label class="checkbox_label">
-        <input type="checkbox" id="pmg_block_refresh">
-        <span>预设条目开关时阻止预设面板刷新</span>
-      </label>
+      <div class="pmg-settings-row" style="margin-left: 28px;">
+        <div style="opacity: 0.9; margin-bottom: 4px;">快捷收藏栏按钮位置</div>
+        <select class="text_pole" id="pmg_quick_fav_btn_place" style="width: min(420px, 100%);">
+          <option value="floating">悬浮自由位置（可拖拽）</option>
+          <option value="qr">QR 栏</option>
+          <option value="send">发送按钮旁</option>
+        </select>
+        <div style="opacity: 0.75; margin-top: 4px;"><small>提示：切换到 QR/发送按钮旁后将禁用拖拽（切回悬浮后恢复上次悬浮位置）。</small></div>
+      </div>
+      <div class="pmg-settings-row">
+        <label class="checkbox_label">
+          <input type="checkbox" id="pmg_favorites_expand_default">
+          <span>收藏栏：分组默认展开</span>
+        </label>
+      </div>
     </div>
   </div>
 
@@ -3728,6 +5996,7 @@
     const elGrouping = $('#pmg_grouping_enabled');
     const elSecond = $('#pmg_second_level');
     const elHide = $('#pmg_hide_prefix');
+    const elDisableNativeDrag = $('#pmg_disable_native_drag');
     const elPrefixBracket = $('#pmg_prefix_bracket');
     const elPrefixDash = $('#pmg_prefix_dash');
     const elPrefixCustomWrapper = $('#pmg_prefix_custom_wrapper');
@@ -3739,62 +6008,17 @@
     const elFavPanel = $('#pmg_favorites_panel');
     const elFloatingPanel = $('#pmg_floating_panel');
     const elQuickFavPlace = $('#pmg_quick_fav_btn_place');
-    const elBlockRefresh = $('#pmg_block_refresh');
     const elFavExpandDefault = $('#pmg_favorites_expand_default');
     const btnApply = $('#pmg_btn_apply');
     const btnClear = $('#pmg_btn_clear_fav');
-
-    const installDrawer = (drawerKey, defaultExpanded = false) => {
-      const header = container.querySelector(`[data-pmg-drawer="${drawerKey}"]`);
-      const content = container.querySelector(`[data-pmg-drawer-content="${drawerKey}"]`);
-      if (!(header instanceof HTMLElement) || !(content instanceof HTMLElement)) return;
-      const icon = header.querySelector('.inline-drawer-icon');
-      const remembered = config?.settingsDrawerExpanded && typeof config.settingsDrawerExpanded === 'object'
-        ? config.settingsDrawerExpanded[drawerKey]
-        : undefined;
-      let expanded = typeof remembered === 'boolean' ? remembered : !!defaultExpanded;
-
-      const refresh = () => {
-        content.style.display = expanded ? 'block' : 'none';
-        if (icon instanceof HTMLElement) {
-          icon.classList.toggle('fa-circle-chevron-up', expanded);
-          icon.classList.toggle('up', expanded);
-          icon.classList.toggle('fa-circle-chevron-down', !expanded);
-          icon.classList.toggle('down', !expanded);
-        }
-      };
-
-      header.addEventListener('click', async (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        expanded = !expanded;
-        config.settingsDrawerExpanded =
-          config.settingsDrawerExpanded && typeof config.settingsDrawerExpanded === 'object'
-            ? config.settingsDrawerExpanded
-            : {};
-        config.settingsDrawerExpanded[drawerKey] = expanded;
-        refresh();
-
-        try {
-          await saveConfig();
-        } catch {
-          // ignore
-        }
-      });
-
-      refresh();
-    };
-
-    // 次要选项默认收起，保持简洁
-    installDrawer('grouping_options', false);
-    installDrawer('prefix_rules', false);
-    installDrawer('favorites_options', false);
-    installDrawer('help', true);
+    const elNativePanelCollapse = $('#pmg_native_panel_collapse_enabled');
+    const elNativePresetEnhanced = $('#pmg_native_preset_enhanced_enabled');
 
     const syncToUI = () => {
       if (elGrouping) elGrouping.checked = !!config.groupingEnabled;
       if (elSecond) elSecond.checked = !!config.secondLevelEnabled;
       if (elHide) elHide.checked = !!config.hidePrefixes;
+      if (elDisableNativeDrag) elDisableNativeDrag.checked = !!config.disableNativeDragWhenGrouped;
       if (elPrefixBracket) elPrefixBracket.checked = !!config.prefixBracketEnabled;
       if (elPrefixDash) elPrefixDash.checked = !!config.prefixDashEnabled;
       if (elPrefixCustomWrapper) elPrefixCustomWrapper.checked = !!config.prefixCustomWrapperEnabled;
@@ -3806,8 +6030,9 @@
       if (elFavPanel) elFavPanel.checked = !!config.favoritesPanelEnabled;
       if (elFloatingPanel) elFloatingPanel.checked = !!config.floatingPanelEnabled;
       if (elQuickFavPlace instanceof HTMLSelectElement) elQuickFavPlace.value = String(config.quickFavoritesButtonPlacement || 'floating');
-      if (elBlockRefresh) elBlockRefresh.checked = !!config.blockPresetUiRefreshOnToggle;
       if (elFavExpandDefault) elFavExpandDefault.checked = !!config.favoritesExpandGroupsByDefault;
+      if (elNativePanelCollapse) elNativePanelCollapse.checked = !!config.nativePanelCollapseEnabled;
+      if (elNativePresetEnhanced) elNativePresetEnhanced.checked = !!config.nativePresetEnhancedEnabled;
 
       if (elQuickFavPlace instanceof HTMLSelectElement) {
         elQuickFavPlace.disabled = !(config.favoritesEnabled && config.floatingPanelEnabled);
@@ -3823,6 +6048,7 @@
       config.groupingEnabled = !!elGrouping?.checked;
       config.secondLevelEnabled = !!elSecond?.checked;
       config.hidePrefixes = !!elHide?.checked;
+      config.disableNativeDragWhenGrouped = !!elDisableNativeDrag?.checked;
       config.prefixBracketEnabled = !!elPrefixBracket?.checked;
       config.prefixDashEnabled = !!elPrefixDash?.checked;
       config.prefixCustomWrapperEnabled = !!elPrefixCustomWrapper?.checked;
@@ -3836,21 +6062,25 @@
       if (elQuickFavPlace instanceof HTMLSelectElement) {
         config.quickFavoritesButtonPlacement = String(elQuickFavPlace.value || 'floating');
       }
-      config.blockPresetUiRefreshOnToggle = !!elBlockRefresh?.checked;
+      config.blockPresetUiRefreshOnToggle = true;
       config.favoritesExpandGroupsByDefault = !!elFavExpandDefault?.checked;
 
-      if (config.blockPresetUiRefreshOnToggle) installRenderPatch();
-      else uninstallRenderPatch();
+      await installPromptManagerNativePatch();
+      applyNativeDragState(currentListEl);
 
       updateFloatingPanelVisibility();
       syncToUI();
+      refreshPromptManagerToolbarShortcutState();
       await saveConfig();
-      debounceApply('settings-changed', 0);
+      if (!requestPromptManagerNativeRender(false)) {
+        debounceApply('settings-changed', 0);
+      }
     };
 
     elGrouping?.addEventListener('change', onChange);
     elSecond?.addEventListener('change', onChange);
     elHide?.addEventListener('change', onChange);
+    elDisableNativeDrag?.addEventListener('change', onChange);
     elPrefixBracket?.addEventListener('change', onChange);
     elPrefixDash?.addEventListener('change', onChange);
     elPrefixCustomWrapper?.addEventListener('change', onChange);
@@ -3862,10 +6092,34 @@
     elFavPanel?.addEventListener('change', onChange);
     elFloatingPanel?.addEventListener('change', onChange);
     elQuickFavPlace?.addEventListener('change', onChange);
-    elBlockRefresh?.addEventListener('change', onChange);
     elFavExpandDefault?.addEventListener('change', onChange);
 
     btnApply?.addEventListener('click', () => debounceApply('manual-apply', 0));
+
+    // ----- 原生预设界面区域折叠 -----
+    elNativePanelCollapse?.addEventListener('change', async () => {
+      config.nativePanelCollapseEnabled = !!elNativePanelCollapse.checked;
+      if (config.nativePanelCollapseEnabled) {
+        scanAndAttachNativeCollapse();
+        scheduleNativePanelCollapseRetry(6000, 250);
+      } else {
+        teardownNativePanelCollapse();
+      }
+      syncToUI();
+      await saveConfig();
+    });
+
+    elNativePresetEnhanced?.addEventListener('change', async () => {
+      config.nativePresetEnhancedEnabled = !!elNativePresetEnhanced.checked;
+      if (config.nativePresetEnhancedEnabled) {
+        attachNativePresetSelectEnhancer();
+        scheduleNativePresetSelectEnhance(0);
+      } else {
+        teardownNativePresetSelectEnhancer();
+      }
+      await saveConfig();
+    });
+
     btnClear?.addEventListener('click', async () => {
       if (activePresetName) {
         config.favoritesByPreset =
@@ -3876,40 +6130,12 @@
       } else {
         config.favorites = { group1: [], group2: [], items: [] };
       }
-      await saveConfig();
+      persistNoRefreshUiStateToLocalStorage();
       debounceApply('clear-fav', 0);
     });
 
     syncToUI();
     return () => { };
-  }
-
-
-  async function registerSettingsPanel() {
-    const ST_API = getSTApi();
-    if (!ST_API?.ui?.registerSettingsPanel) {
-      warn('ST_API.ui.registerSettingsPanel not available');
-      return;
-    }
-
-    const panelId = `${PLUGIN_NS}.settings`;
-
-    try {
-      await ST_API.ui.unregisterSettingsPanel({ id: panelId });
-    } catch { /* ignore */ }
-
-    await ST_API.ui.registerSettingsPanel({
-      id: panelId,
-      title: 'Prompt Manager 分组/收藏',
-      target: 'right',
-      expanded: false,
-      order: 50,
-      content: {
-        kind: 'render',
-        render: (container) => renderSettingsUI(container),
-
-      },
-    });
   }
 
   async function unregisterSettingsPanelEntry() {
@@ -3950,6 +6176,10 @@
     listObserver?.disconnect();
     listObserver = new MutationObserver((mutations) => {
       if (applying) return;
+      if (isOwnListMutationSuppressed()) {
+        return;
+      }
+
       let shouldApply = false;
       for (const m of mutations) {
         if (m.type === 'attributes') {
@@ -3965,7 +6195,13 @@
         shouldApply = true;
         break;
       }
-      if (shouldApply) debounceApply('list-mutation', 60);
+      if (shouldApply) {
+        if (promptListDragActive) {
+          markApplyPendingAfterPromptDrag('list-mutation');
+          return;
+        }
+        debounceApply('list-mutation', 60);
+      }
     });
 
     listObserver.observe(listEl, {
@@ -3979,7 +6215,7 @@
   }
 
   function detachFromList() {
-    if (renderPatchState?.installed) {
+    if (typeof renderPatchState !== 'undefined' && renderPatchState?.installed) {
       renderPatchState.freezeActive = false;
       renderPatchState.pendingDryRun = false;
     }
@@ -3994,10 +6230,21 @@
       const list = findPromptManagerList();
       if (list && list !== currentListEl) attachToList(list);
       else if (!list && currentListEl) detachFromList();
+
+      // 原生预设界面区域折叠：每次 body mutation 时去扫一遍，确保抽屉 / range-block 重新挂载后仍然被折叠头包裹
+      if (config.nativePanelCollapseEnabled) {
+        debounceScanNativePanelCollapse(120);
+        scheduleNativePanelCollapseRetry(2500, 350);
+      }
+      attachNativePresetSelectEnhancer();
     });
     bodyObserver.observe(document.body, { childList: true, subtree: true });
     const list = findPromptManagerList();
     if (list) attachToList(list);
+    attachNativePresetSelectEnhancer();
+    if (config.nativePanelCollapseEnabled) {
+      scheduleNativePanelCollapseRetry(8000, 300);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -4029,7 +6276,23 @@
 
       ensurePromptManagerToolbar(currentListEl);
 
-      applyGrouping();
+      const forceRegroup = forceRegroupAfterPromptDrag;
+      forceRegroupAfterPromptDrag = false;
+
+      if (!config.groupingEnabled) {
+        delete currentListEl.dataset.pmgNativeRendered;
+        applyGrouping();
+      } else if (currentListEl.dataset.pmgNativeRendered === '1') {
+        if (forceRegroup) {
+          applyGrouping();
+        } else {
+          applyNativeDragState(currentListEl);
+          applyCollapseVisibility();
+        }
+      } else {
+        applyGrouping();
+      }
+
       renderAllFavoritesPanels();
     } catch (e) {
       warn('applyAll failed:', e);
@@ -4063,15 +6326,20 @@
     // 预先获取当前预设名（用于按预设隔离收藏）
     try { await refreshActivePresetName(true); } catch { /* ignore */ }
 
-    if (config.blockPresetUiRefreshOnToggle) {
-      try { await installRenderPatch(); } catch { /* ignore */ }
-    }
+    try { await installPromptManagerNativePatch(); } catch { /* ignore */ }
 
     try { await unregisterSettingsPanelEntry(); } catch { /* ignore */ }
 
     updateFloatingPanelVisibility();
     startBodyObserver();
     debounceApply('init', 0);
+
+    // 原生预设界面区域折叠：初始扫描一次（实际生效依赖目标 DOM 已渲染，否则由 body observer 兜底）
+    debounceScanNativePanelCollapse(0);
+    scheduleNativePanelCollapseRetry(12000, 300);
+
+    // 原生 OpenAI 预设下拉栏增强：收藏置顶 + 不切换管理操作
+    attachNativePresetSelectEnhancer();
 
     log('Initialized');
   }
