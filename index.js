@@ -4896,7 +4896,12 @@
   let nativePresetManagerModalEl = null;
   let nativePresetDepsPromise = null;
   let nativePresetReorderTimer = null;
+  let nativePresetSelectTeardownSuppressUntil = 0;
   let nativePresetManagerSearchQuery = '';
+
+  function isNativePresetSelectTeardownSuppressed() {
+    return Date.now() < nativePresetSelectTeardownSuppressUntil;
+  }
 
   const NATIVE_PRESET_SENSITIVE_FIELDS = [
     'reverse_proxy',
@@ -5207,12 +5212,29 @@
   }
 
   function teardownNativePresetSelectEnhancer() {
+    if (isNativePresetSelectTeardownSuppressed()) return;
+
+    if (nativePresetReorderTimer) {
+      clearTimeout(nativePresetReorderTimer);
+      nativePresetReorderTimer = null;
+    }
+
     nativePresetSelectObserver?.disconnect();
     nativePresetSelectObserver = null;
-    document.getElementById(NATIVE_PRESET_TOOLBAR_ID)?.remove();
+
+    const toolbar = document.getElementById(NATIVE_PRESET_TOOLBAR_ID);
+    if (toolbar) toolbar.remove();
 
     const select = findNativePresetSelect();
     if (!(select instanceof HTMLSelectElement)) return;
+
+    const hasEnhancementArtifacts =
+      select.dataset.pmgNativePresetEnhancerAttached === '1' ||
+      !!select.querySelector('optgroup') ||
+      !!select.querySelector('.pmg-native-preset-favorite-option');
+
+    // 已经是原生形态时不要反复重建 option；否则 body MutationObserver 会被自身 teardown 触发而循环。
+    if (!hasEnhancementArtifacts) return;
 
     const selectedValue = select.value;
     const options = getNativePresetOptions(select)
@@ -5227,6 +5249,9 @@
         if (Number.isFinite(an) && Number.isFinite(bn)) return an - bn;
         return getNativePresetOptionName(a).localeCompare(getNativePresetOptionName(b));
       });
+
+    // teardown 会重建 select 子节点，短时间内忽略由此引发的“关闭态再次 teardown”。
+    nativePresetSelectTeardownSuppressUntil = Date.now() + 300;
 
     try {
       select.dataset.pmgNativePresetReordering = '1';
@@ -5324,6 +5349,7 @@
   }
 
   function scheduleNativePresetSelectEnhance(delayMs = 80) {
+    if (!config.nativePresetEnhancedEnabled) return;
     if (nativePresetReorderTimer) clearTimeout(nativePresetReorderTimer);
     nativePresetReorderTimer = setTimeout(() => {
       nativePresetReorderTimer = null;
@@ -5338,6 +5364,7 @@
 
   function attachNativePresetSelectEnhancer() {
     if (!config.nativePresetEnhancedEnabled) {
+      if (isNativePresetSelectTeardownSuppressed()) return false;
       teardownNativePresetSelectEnhancer();
       return false;
     }
@@ -5346,15 +5373,23 @@
 
     let shouldInitialEnhance = false;
 
-    if (select.dataset.pmgNativePresetEnhancerAttached !== '1') {
-      select.addEventListener('change', () => {
+    if (!select.__pmgNativePresetChangeHandler) {
+      select.__pmgNativePresetChangeHandler = () => {
+        if (!config.nativePresetEnhancedEnabled) return;
         refreshNativePresetToolbarState();
         scheduleNativePresetSelectEnhance(80);
         if (config.nativePanelCollapseEnabled) {
           debounceScanNativePanelCollapse(120);
           scheduleNativePanelCollapseRetry(5000, 300);
         }
-      });
+      };
+    }
+
+    if (select.dataset.pmgNativePresetEnhancerAttached !== '1') {
+      if (!select.__pmgNativePresetChangeHandlerInstalled) {
+        select.addEventListener('change', select.__pmgNativePresetChangeHandler);
+        select.__pmgNativePresetChangeHandlerInstalled = true;
+      }
       select.dataset.pmgNativePresetEnhancerAttached = '1';
       shouldInitialEnhance = true;
     }
@@ -5362,6 +5397,7 @@
     if (!nativePresetSelectObserver || nativePresetSelectObserver.__pmgTarget !== select) {
       nativePresetSelectObserver?.disconnect();
       nativePresetSelectObserver = new MutationObserver(() => {
+        if (!config.nativePresetEnhancedEnabled) return;
         if (select.dataset.pmgNativePresetReordering === '1') return;
         scheduleNativePresetSelectEnhance(80);
       });
@@ -6236,12 +6272,12 @@
         debounceScanNativePanelCollapse(120);
         scheduleNativePanelCollapseRetry(2500, 350);
       }
-      attachNativePresetSelectEnhancer();
+      if (config.nativePresetEnhancedEnabled) attachNativePresetSelectEnhancer();
     });
     bodyObserver.observe(document.body, { childList: true, subtree: true });
     const list = findPromptManagerList();
     if (list) attachToList(list);
-    attachNativePresetSelectEnhancer();
+    if (config.nativePresetEnhancedEnabled) attachNativePresetSelectEnhancer();
     if (config.nativePanelCollapseEnabled) {
       scheduleNativePanelCollapseRetry(8000, 300);
     }
