@@ -36,6 +36,15 @@
 
   let applying = false;
   let applyTimer = null;
+  let favoritesRenderFrame = 0;
+
+  function scheduleFavoritesRender() {
+    if (favoritesRenderFrame) return;
+    favoritesRenderFrame = requestAnimationFrame(() => {
+      favoritesRenderFrame = 0;
+      renderAllFavoritesPanels();
+    });
+  }
 
   // 拖拽排序性能保护：拖拽过程中 jQuery UI sortable 会产生大量 childList mutation。
   // 如果每次 mutation 都触发 PMG 重分组 / 收藏栏刷新，会导致明显卡顿。
@@ -512,15 +521,22 @@
     const originalInit = typeof proto.init === 'function' ? proto.init : null;
     const originalMakeDraggable = typeof proto.makeDraggable === 'function' ? proto.makeDraggable : null;
 
-    proto.renderPromptManagerListItems = async function pmgNativeRenderPromptManagerListItems() {
+    proto.renderPromptManagerListItems = async function pmgNativeRenderPromptManagerListItems(...args) {
+      if (promptManagerNativePatchState) promptManagerNativePatchState.lastInstance = this;
+      patchPromptManagerInstanceToggle(this);
+
       if (!config.groupingEnabled) {
         if (this.listElement instanceof HTMLElement) {
           delete this.listElement.dataset.pmgNativeRendered;
         }
-        return originalRenderPromptManagerListItems.call(this);
+        const result = await originalRenderPromptManagerListItems.apply(this, args);
+        if (this.listElement instanceof HTMLElement) {
+          if (this.listElement !== currentListEl) attachToList(this.listElement);
+          applyGrouping();
+        }
+        return result;
       }
 
-      promptManagerNativePatchState && (promptManagerNativePatchState.lastInstance = this);
       return renderPromptManagerListItemsWithPmgGroups.call(this);
     };
     proto.renderPromptManagerListItems.__pmgNativePatched = true;
@@ -561,6 +577,18 @@
       lastInstance: null,
     };
 
+    // PromptManager 通常早于扩展初始化。主动补丁现存实例，避免首次 toggle 仍持有原生 handler。
+    try {
+      const openAiMod = await import('/scripts/openai.js');
+      const existingInstance = openAiMod?.promptManager;
+      if (existingInstance) {
+        promptManagerNativePatchState.lastInstance = existingInstance;
+        patchPromptManagerInstanceToggle(existingInstance);
+      }
+    } catch (e) {
+      warn('Failed to patch existing PromptManager instance:', e);
+    }
+
     log('PromptManager native render patched');
   }
 
@@ -589,13 +617,13 @@
 
   function handlePromptToggleWithoutRender(event) {
     const target = event?.target;
-    if (!(target instanceof HTMLElement)) return;
+    if (!(target instanceof HTMLElement)) return false;
     const promptLi = target.closest('.' + this.configuration.prefix + 'prompt_manager_prompt');
     const promptID = promptLi?.dataset?.pmIdentifier;
-    if (!promptID) return;
+    if (!promptID) return false;
 
     const promptOrderEntry = this.getPromptOrderEntry(this.activeCharacter, promptID);
-    if (!promptOrderEntry) return;
+    if (!promptOrderEntry) return false;
 
     const counts = this.tokenHandler?.getCounts?.();
     if (counts) counts[promptID] = null;
@@ -603,13 +631,19 @@
     promptOrderEntry.enabled = !promptOrderEntry.enabled;
     updatePromptToggleDom(this, promptID, promptOrderEntry.enabled);
 
+    savePromptManagerSettings(this);
+    scheduleFavoritesRender();
+    return true;
+  }
+
+  function savePromptManagerSettings(pm) {
     try {
-      this.saveServiceSettings();
+      void Promise.resolve(pm?.saveServiceSettings?.()).catch((e) => {
+        warn('Failed to save prompt toggle state:', e);
+      });
     } catch (e) {
       warn('Failed to save prompt toggle state:', e);
     }
-
-    setTimeout(renderAllFavoritesPanels, 30);
   }
 
   function updatePromptToggleDom(pm, promptID, enabled) {
@@ -841,13 +875,6 @@
     bindPromptManagerListEvents(this, promptManagerList);
     applyNativeDragState(promptManagerList);
     applyCollapseVisibility();
-  }
-
-  function activateRenderFreeze() {
-    // 兼容旧调用点：native patch 下开关由 handlePromptToggleWithoutRender 处理，不再需要冻结 render。
-    if (!promptManagerNativePatchState?.installed) {
-      void installPromptManagerNativePatch();
-    }
   }
 
   function requestPromptManagerNativeRender(afterTryGenerate = false) {
@@ -2271,7 +2298,7 @@
         await applyBatchPromptRename(updates);
         updatePromptManagerDomNames(updates);
         debounceApply('prefix-editor-applied', 0);
-        setTimeout(renderAllFavoritesPanels, 80);
+        scheduleFavoritesRender();
 
         // 更新 editor 列表的显示（不重渲染，保留勾选状态）
         const rulesAll = buildPrefixParseRulesAll();
@@ -2406,7 +2433,7 @@
       toggleFavoriteItem(identifier);
       refreshVisual();
       persistNoRefreshUiStateToLocalStorage();
-      renderAllFavoritesPanels();
+      scheduleFavoritesRender();
     };
 
     btn.addEventListener('click', onToggle);
@@ -2414,8 +2441,9 @@
       if (e.key === 'Enter' || e.key === ' ') onToggle(e);
     });
 
-    controls.appendChild(btn);
+    // 在挂载到可见 DOM 前应用最终状态，避免默认样式短暂出现。
     refreshVisual();
+    controls.appendChild(btn);
   }
 
   function removeItemFavoriteButton(li) {
@@ -2506,7 +2534,7 @@
       refreshVisual();
       applyCurrentCollapseVisibility();
       persistNoRefreshUiStateToLocalStorage();
-      renderAllFavoritesPanels();
+      scheduleFavoritesRender();
     };
 
     row.addEventListener('click', toggleCollapse);
@@ -2525,7 +2553,7 @@
       }
       refreshVisual();
       persistNoRefreshUiStateToLocalStorage();
-      renderAllFavoritesPanels();
+      scheduleFavoritesRender();
     };
 
     if (fav) {
@@ -3001,13 +3029,12 @@
   // Shared Favorites Content Rendering
   // ---------------------------------------------------------------------------
 
-  function normalizeFavoritesData() {
+  function normalizeFavoritesData(snapshot = getPromptItemsSnapshot()) {
     try {
-      const snapshot = getPromptItemsSnapshot();
       const store = getScopedFavoritesStore();
 
-      const itemIdSet = new Set(snapshot.map((x) => x.identifier).filter(Boolean));
-      store.items = (store.items || []).filter((id) => itemIdSet.has(id));
+      // DOM 可能正处于宿主异步重建阶段。渲染时只去重/迁移，不删除暂时无法解析的收藏。
+      store.items = ensureArrayUnique(store.items || []);
 
       const group1IdSet = new Set(snapshot.filter((x) => x.hasPrefix && x.group1Id).map((x) => x.group1Id));
       const group2IdSet = new Set(snapshot.filter((x) => x.hasPrefix && x.group2Id).map((x) => x.group2Id));
@@ -3044,10 +3071,12 @@
         // legacy: group1 name
         if (!looksLikeGroup1Id(g)) {
           const id = group1NameToId.get(String(g));
-          if (id) migratedGroup1.push(id);
+          migratedGroup1.push(id || g);
+        } else {
+          migratedGroup1.push(g);
         }
       }
-      store.group1 = ensureArrayUnique(migratedGroup1).filter((id) => group1IdSet.has(id));
+      store.group1 = ensureArrayUnique(migratedGroup1);
 
       // group2
       const migratedGroup2 = [];
@@ -3056,10 +3085,12 @@
         // legacy: group2Key(group1Name, group2Name)
         if (!looksLikeGroup2Id(k) && String(k).includes('|||')) {
           const id = group2KeyToId.get(String(k));
-          if (id) migratedGroup2.push(id);
+          migratedGroup2.push(id || k);
+        } else {
+          migratedGroup2.push(k);
         }
       }
-      store.group2 = ensureArrayUnique(migratedGroup2).filter((id) => group2IdSet.has(id));
+      store.group2 = ensureArrayUnique(migratedGroup2);
     } catch {
       // ignore
     }
@@ -3137,13 +3168,36 @@
     });
   }
 
+  function setPromptItemsEnabled(items, enabled) {
+    const pm = promptManagerNativePatchState?.lastInstance;
+    if (!pm || pm.listElement !== currentListEl || !Array.isArray(items) || items.length === 0) return false;
+
+    let changed = false;
+    const counts = pm.tokenHandler?.getCounts?.();
+    for (const item of items) {
+      const identifier = item?.identifier;
+      if (!identifier) continue;
+      const entry = pm.getPromptOrderEntry(pm.activeCharacter, identifier);
+      if (!entry || entry.enabled === enabled) continue;
+      entry.enabled = enabled;
+      if (counts) counts[identifier] = null;
+      updatePromptToggleDom(pm, identifier, enabled);
+      changed = true;
+    }
+
+    if (changed) {
+      savePromptManagerSettings(pm);
+      scheduleFavoritesRender();
+    }
+    return changed;
+  }
+
   function toggleGroupPromptsByGroup1Id(group1Id) {
     const snapshot = getPromptItemsSnapshot();
     const items = snapshot.filter((x) => x.hasPrefix && x.group1Id === group1Id);
     if (items.length === 0) return;
     const enabledCount = items.reduce((acc, x) => acc + (isPromptEnabled(x.li) ? 1 : 0), 0);
-    const targetEnable = enabledCount !== items.length;
-    for (const it of items) clickPromptToggle(it.li, targetEnable);
+    setPromptItemsEnabled(items, enabledCount !== items.length);
   }
 
   function toggleGroupPromptsByGroup2Id(group2Id) {
@@ -3151,8 +3205,7 @@
     const items = snapshot.filter((x) => x.hasPrefix && x.group2Id === group2Id);
     if (items.length === 0) return;
     const enabledCount = items.reduce((acc, x) => acc + (isPromptEnabled(x.li) ? 1 : 0), 0);
-    const targetEnable = enabledCount !== items.length;
-    for (const it of items) clickPromptToggle(it.li, targetEnable);
+    setPromptItemsEnabled(items, enabledCount !== items.length);
   }
 
   function isPromptEnabled(li) {
@@ -3165,7 +3218,6 @@
     const toggle = getPromptToggleIcon(li);
     if (!toggle) return;
     const isOn = toggle.classList.contains('fa-toggle-on');
-    if (config.blockPresetUiRefreshOnToggle) activateRenderFreeze();
     if (enable && !isOn) toggle.click();
     if (!enable && isOn) toggle.click();
   }
@@ -3180,8 +3232,7 @@
     });
     if (items.length === 0) return;
     const enabledCount = items.reduce((acc, x) => acc + (isPromptEnabled(x.li) ? 1 : 0), 0);
-    const targetEnable = enabledCount !== items.length;
-    for (const it of items) clickPromptToggle(it.li, targetEnable);
+    setPromptItemsEnabled(items, enabledCount !== items.length);
   }
 
   function toggleItemPromptByIdentifier(identifier) {
@@ -3214,13 +3265,12 @@
       return;
     }
 
-    normalizeFavoritesData();
+    const snapshot = getPromptItemsSnapshot();
+    normalizeFavoritesData(snapshot);
     const favStore = getScopedFavoritesStore();
     const favGroup1Ids = ensureArrayUnique(favStore.group1);
     const favGroup2Ids = ensureArrayUnique(favStore.group2);
     const favItems = ensureArrayUnique(favStore.items);
-
-    const snapshot = getPromptItemsSnapshot();
 
     // id -> display mapping
     const group1IdToName = new Map();
@@ -3306,7 +3356,7 @@
       cToggle.addEventListener('click', (e) => {
         e.preventDefault(); e.stopPropagation();
         toggleItemPromptByIdentifier(it.identifier);
-        setTimeout(renderAllFavoritesPanels, 60);
+        scheduleFavoritesRender();
       });
       const favOn = isItemFavorited(it.identifier);
       cFav.classList.toggle('pmg-fav-on', favOn);
@@ -3316,7 +3366,7 @@
         e.preventDefault(); e.stopPropagation();
         toggleFavoriteItem(it.identifier);
         persistNoRefreshUiStateToLocalStorage();
-        renderAllFavoritesPanels();
+        scheduleFavoritesRender();
         debounceApply(debugTag || 'toggle-fav-item', 0);
       });
       container.appendChild(cRow);
@@ -3346,7 +3396,7 @@
         if (e?.stopPropagation) e.stopPropagation();
         setFavoritesGroup1Expanded(g1Id, !isFavoritesGroup1Expanded(g1Id));
         persistNoRefreshUiStateToLocalStorage();
-        renderAllFavoritesPanels();
+        scheduleFavoritesRender();
       };
 
       exp.addEventListener('click', toggleExpand);
@@ -3361,7 +3411,7 @@
         btnToggle.addEventListener('click', (e) => {
           e.preventDefault(); e.stopPropagation();
           toggleGroupPromptsByGroup1Id(g1Id);
-          setTimeout(renderAllFavoritesPanels, 60);
+          scheduleFavoritesRender();
         });
       }
 
@@ -3369,7 +3419,7 @@
         e.preventDefault(); e.stopPropagation();
         toggleFavoriteGroup1(g1Id);
         persistNoRefreshUiStateToLocalStorage();
-        renderAllFavoritesPanels();
+        scheduleFavoritesRender();
         debounceApply('unfav-group1', 0);
       });
 
@@ -3421,7 +3471,7 @@
             if (ev?.stopPropagation) ev.stopPropagation();
             setFavoritesGroup2Expanded(g2Id, !isFavoritesGroup2Expanded(g2Id));
             persistNoRefreshUiStateToLocalStorage();
-            renderAllFavoritesPanels();
+            scheduleFavoritesRender();
           };
           g2Exp.addEventListener('click', toggleG2Expand);
           g2Row.addEventListener('click', (ev) => {
@@ -3434,14 +3484,14 @@
             g2Toggle.addEventListener('click', (ev) => {
               ev.preventDefault(); ev.stopPropagation();
               toggleGroupPromptsByGroup2Id(g2Id);
-              setTimeout(renderAllFavoritesPanels, 60);
+              scheduleFavoritesRender();
             });
           }
           g2Fav.addEventListener('click', async (ev) => {
             ev.preventDefault(); ev.stopPropagation();
             toggleFavoriteGroup2(g2Id);
             persistNoRefreshUiStateToLocalStorage();
-            renderAllFavoritesPanels();
+            scheduleFavoritesRender();
             debounceApply('unfav-sub-group2', 0);
           });
           children.appendChild(g2Row);
@@ -3478,7 +3528,7 @@
         if (e?.stopPropagation) e.stopPropagation();
         setFavoritesGroup2Expanded(g2Id, !isFavoritesGroup2Expanded(g2Id));
         persistNoRefreshUiStateToLocalStorage();
-        renderAllFavoritesPanels();
+        scheduleFavoritesRender();
       };
 
       exp.addEventListener('click', toggleExpand);
@@ -3493,7 +3543,7 @@
         btnToggle.addEventListener('click', (e) => {
           e.preventDefault(); e.stopPropagation();
           toggleGroupPromptsByGroup2Id(g2Id);
-          setTimeout(renderAllFavoritesPanels, 60);
+          scheduleFavoritesRender();
         });
       }
 
@@ -3501,7 +3551,7 @@
         e.preventDefault(); e.stopPropagation();
         toggleFavoriteGroup2(g2Id);
         persistNoRefreshUiStateToLocalStorage();
-        renderAllFavoritesPanels();
+        scheduleFavoritesRender();
         debounceApply('unfav-group2', 0);
       });
 
@@ -3518,9 +3568,11 @@
     // 3) 单独条目
     const favGroup1Set2 = new Set(favGroup1Ids);
     const effectiveGroup2Set2 = new Set(effectiveGroup2Ids);
+    const favItemSet = new Set(favItems);
+    const snapshotByIdentifier = new Map(snapshot.map((x) => [x.identifier, x]));
     const coveredFavItems = new Set();
     for (const x of snapshot) {
-      if (!new Set(favItems).has(x.identifier)) continue;
+      if (!favItemSet.has(x.identifier)) continue;
       if (!x.hasPrefix) continue;
       if (x.group1Id && favGroup1Set2.has(x.group1Id)) { coveredFavItems.add(x.identifier); continue; }
       if (x.group2Id && effectiveGroup2Set2.has(x.group2Id)) { coveredFavItems.add(x.identifier); continue; }
@@ -3528,7 +3580,7 @@
 
     for (const id of favItems) {
       if (coveredFavItems.has(id)) continue;
-      const found = snapshot.find((x) => x.identifier === id);
+      const found = snapshotByIdentifier.get(id);
       const titleText = found ? getDisplayName(found) : id;
       const { row, btnToggle, btnUnfav } = makeRow(titleText);
 
@@ -3544,14 +3596,14 @@
       btnToggle.addEventListener('click', (e) => {
         e.preventDefault(); e.stopPropagation();
         toggleItemPromptByIdentifier(id);
-        setTimeout(renderAllFavoritesPanels, 60);
+        scheduleFavoritesRender();
       });
 
       btnUnfav.addEventListener('click', async (e) => {
         e.preventDefault(); e.stopPropagation();
         toggleFavoriteItem(id);
         persistNoRefreshUiStateToLocalStorage();
-        renderAllFavoritesPanels();
+        scheduleFavoritesRender();
         debounceApply('unfav-item', 0);
       });
 
@@ -4997,7 +5049,7 @@
     const before = getNativePresetCurrentName();
     if (before === key) {
       refreshNativePresetToolbarState();
-      renderAllFavoritesPanels();
+      scheduleFavoritesRender();
       return true;
     }
 
@@ -5022,7 +5074,7 @@
     // 原生 change 会异步刷新 Prompt Manager；这里延迟同步收藏栏标题和提示词收藏范围。
     setTimeout(() => {
       void refreshActivePresetName(true).finally(() => {
-        renderAllFavoritesPanels();
+        scheduleFavoritesRender();
         debounceApply('native-preset-quick-switch', 0);
       });
     }, 180);
@@ -5114,7 +5166,7 @@
         e.preventDefault();
         e.stopPropagation();
         await toggleNativePresetFavorite(presetName);
-        renderAllFavoritesPanels();
+        scheduleFavoritesRender();
       });
       btnUnfav.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' || e.key === ' ') btnUnfav.click();
@@ -5313,7 +5365,7 @@
         await toggleNativePresetFavorite(name);
         refreshNativePresetToolbarState();
         renderNativePresetManagerIfOpen();
-        renderAllFavoritesPanels();
+        scheduleFavoritesRender();
       };
       star.addEventListener('click', toggleCurrent);
       star.addEventListener('keydown', (e) => {
@@ -6196,18 +6248,26 @@
     // 注入 Prompt Manager 顶部工具栏（设置 / 快速前缀编辑）
     ensurePromptManagerToolbar(listEl);
 
-    listEl.addEventListener(
-      'click',
-      (e) => {
-        const t = e.target;
-        if (!(t instanceof HTMLElement)) return;
-        if (t.closest('.prompt-manager-toggle-action')) {
-          if (config.blockPresetUiRefreshOnToggle) activateRenderFreeze();
-          setTimeout(renderAllFavoritesPanels, 80);
-        }
-      },
-      true
-    );
+    if (listEl.dataset.pmgToggleDelegateAttached !== '1') {
+      listEl.addEventListener(
+        'click',
+        (e) => {
+          if (!config.blockPresetUiRefreshOnToggle) return;
+          const t = e.target;
+          if (!(t instanceof HTMLElement) || !t.closest('.prompt-manager-toggle-action')) return;
+          const pm = promptManagerNativePatchState?.lastInstance;
+          if (!pm || pm.listElement !== listEl || !listEl.contains(t)) return;
+
+          // 捕获阶段抢先处理；仅成功更新 model 后才阻止旧原生 handler 调用完整 render()。
+          const handled = handlePromptToggleWithoutRender.call(pm, e);
+          if (!handled) return;
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        },
+        true
+      );
+      listEl.dataset.pmgToggleDelegateAttached = '1';
+    }
 
     listObserver?.disconnect();
     listObserver = new MutationObserver((mutations) => {
@@ -6251,10 +6311,6 @@
   }
 
   function detachFromList() {
-    if (typeof renderPatchState !== 'undefined' && renderPatchState?.installed) {
-      renderPatchState.freezeActive = false;
-      renderPatchState.pendingDryRun = false;
-    }
     listObserver?.disconnect();
     listObserver = null;
     currentListEl = null;
